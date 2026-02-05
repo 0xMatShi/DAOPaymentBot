@@ -388,7 +388,7 @@ def menu_new_referral() -> None:
     code = create_referral_link(max_uses, custom_prices, name)
 
     # Формируем ссылку
-    referral_url = f"https://t.me/ANdexDAOPaymentBot?start={code}"
+    referral_url = f"https://t.me/DAOPayment_Bot?start={code}"
 
     # Сохраняем в файл
     os.makedirs("data", exist_ok=True)

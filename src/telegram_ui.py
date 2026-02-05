@@ -27,6 +27,8 @@ from src.payments import (
     complete_payment_session,
     record_payment,
     activate_subscription,
+    update_user_profile,
+    get_user_profile,
 )
 
 router = Router()
@@ -104,12 +106,16 @@ def back_kb(callback_data: str = "back_to_main") -> InlineKeyboardMarkup:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    logger.info(f"User {message.from_user.id} started the bot") # type: ignore
+    user = message.from_user  # type: ignore
+    logger.info(f"User {user.id} started the bot")
+
+    # Сохраняем/обновляем профиль пользователя
+    update_user_profile(user.id, user.username, user.first_name, user.last_name)
 
     # Очищаем FSM при рестарте
     await state.clear()
 
-    cancel_user_payment_sessions(message.from_user.id)  # type: ignore
+    cancel_user_payment_sessions(user.id)
     await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_kb())
 
 
@@ -128,14 +134,18 @@ async def get_chat_id_command(message: Message) -> None:
 
 @router.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery) -> None:
-    cancel_user_payment_sessions(callback.from_user.id)
+    user = callback.from_user
+    update_user_profile(user.id, user.username, user.first_name, user.last_name)
+    cancel_user_payment_sessions(user.id)
     await callback.message.edit_text(MAIN_MENU_TEXT, reply_markup=main_menu_kb()) # type: ignore
     await callback.answer()
 
 
 @router.callback_query(F.data == "subscribe")
 async def show_plans(callback: CallbackQuery) -> None:
-    logger.info(f"User {callback.from_user.id} opened subscription plans")
+    user = callback.from_user
+    update_user_profile(user.id, user.username, user.first_name, user.last_name)
+    logger.info(f"User {user.id} opened subscription plans")
     await callback.message.edit_text( # type: ignore
         "Выберите одну из предложенных подписок:",
         reply_markup=plans_kb(),
@@ -365,10 +375,19 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
     admin_chat_id = os.getenv("ADMIN_CHAT_ID")
     if admin_chat_id:
         try:
+            # Получаем профиль пользователя для отображения username
+            profile = get_user_profile(user_id)
+            user_display = f"{user_id}"
+            if profile:
+                if profile.get("username"):
+                    user_display += f" | @{profile['username']}"
+                elif profile.get("first_name"):
+                    user_display += f" | {profile['first_name']}"
+
             await bot.send_message(
                 int(admin_chat_id),
                 f"💰 Новая оплата:\n"
-                f"User ID: {user_id}\n"
+                f"Пользователь: {user_display}\n"
                 f"План: {plan.get('label', plan_id)}\n"
                 f"Сумма: {amount} {tok.get('name', token)}\n"
                 f"Сеть: {net.get('name', network)}\n"

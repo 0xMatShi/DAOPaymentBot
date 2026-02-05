@@ -19,21 +19,17 @@ def get_connection() -> sqlite3.Connection:
 
 
 def get_all_users() -> list[dict]:
-    """Получает всех пользователей из subscriptions и payments (без дубликатов)."""
+    """Получает всех пользователей из user_profiles."""
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Собираем уникальные user_id из subscriptions и payments
+    # Берем всех пользователей из user_profiles
     cursor.execute("""
-        SELECT DISTINCT user_id
-        FROM (
-            SELECT user_id FROM subscriptions
-            UNION
-            SELECT user_id FROM payments
-        )
+        SELECT user_id, username, first_name, last_name
+        FROM user_profiles
         ORDER BY user_id
     """)
-    users = [{"user_id": row["user_id"]} for row in cursor.fetchall()]
+    users = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return users
 
@@ -66,6 +62,20 @@ PLAN_LABELS = {
     "3months": "3 месяца",
     "forever": "Навсегда",
 }
+
+
+def format_user_display(user: dict) -> str:
+    """Форматирует отображение пользователя: ID | @username или ID | FirstName."""
+    user_id = user["user_id"]
+    username = user.get("username")
+    first_name = user.get("first_name")
+
+    if username:
+        return f"{user_id} | @{username}"
+    elif first_name:
+        return f"{user_id} | {first_name}"
+    else:
+        return str(user_id)
 
 
 def change_plan(user_id: int) -> None:
@@ -161,6 +171,13 @@ def show_user_detail(user: dict) -> None:
 
         print("=" * 50)
         print(f"  ID:          {user['user_id']}")
+        if user.get("username"):
+            print(f"  Username:    @{user['username']}")
+        if user.get("first_name"):
+            name = user['first_name']
+            if user.get("last_name"):
+                name += f" {user['last_name']}"
+            print(f"  Имя:         {name}")
         if sub:
             print(f"  Подписка:    {PLAN_LABELS.get(sub['plan'], sub['plan'])}")
             print(f"  Истекает:    {format_expires(sub['expires_at'])}")
@@ -193,7 +210,7 @@ def menu_users() -> None:
 
     while True:
         clear()
-        choices = [f"{u['user_id']}" for u in users]
+        choices = [format_user_display(u) for u in users]
         choices.append("< Назад")
 
         selected = inquirer.select( # type: ignore
@@ -204,7 +221,9 @@ def menu_users() -> None:
         if selected == "< Назад":
             return
 
-        user = next(u for u in users if str(u["user_id"]) == selected)
+        # Извлекаем user_id из выбранной строки (первое число до " |")
+        user_id_str = selected.split(" |")[0] if " |" in selected else selected
+        user = next(u for u in users if str(u["user_id"]) == user_id_str)
         show_user_detail(user)
 
 

@@ -166,6 +166,17 @@ def init_db() -> None:
     if "tx_hash" not in existing_ps:
         cursor.execute("ALTER TABLE payment_sessions ADD COLUMN tx_hash TEXT")
 
+    # Создать таблицу user_profiles для хранения информации о всех пользователях
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -247,6 +258,48 @@ def get_master_wallet(network: str) -> dict | None:
     conn.close()
     if row:
         return {"address": row["wallet_address"], "private_key": row["private_key"]}
+    return None
+
+
+def update_user_profile(user_id: int, username: str | None, first_name: str | None, last_name: str | None) -> None:
+    """Обновляет или создает профиль пользователя."""
+    from datetime import datetime, timezone
+
+    conn = _get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT user_id FROM user_profiles WHERE user_id = ?", (user_id,))
+    exists = cursor.fetchone()
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    if exists:
+        cursor.execute(
+            "UPDATE user_profiles SET username = ?, first_name = ?, last_name = ?, last_interaction = ? WHERE user_id = ?",
+            (username, first_name, last_name, now, user_id),
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO user_profiles (user_id, username, first_name, last_name, last_interaction) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, first_name, last_name, now),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_user_profile(user_id: int) -> dict | None:
+    """Возвращает профиль пользователя."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id, username, first_name, last_name FROM user_profiles WHERE user_id = ?",
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return dict(row)
     return None
 
 

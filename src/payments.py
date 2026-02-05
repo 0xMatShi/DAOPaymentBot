@@ -486,10 +486,14 @@ def get_all_referral_links() -> list[dict]:
     return links
 
 
-def get_plan_price_for_user(user_id: int, plan_id: str) -> int:
-    """Возвращает цену плана для пользователя с учетом реферальной ссылки."""
+def get_plan_price_for_user(user_id: int, plan_id: str) -> float:
+    """Возвращает цену плана для пользователя с учетом реферальной ссылки.
+
+    Returns:
+        float: Цена в долларах (может быть с плавающей точкой)
+    """
     # Дефолтная цена
-    default_price = SUBSCRIPTION_PLANS.get(plan_id, {}).get("price", 0)
+    default_price = float(SUBSCRIPTION_PLANS.get(plan_id, {}).get("price", 0))
 
     # Проверяем реферальный код
     referral_code = get_user_referral_code(user_id)
@@ -500,9 +504,9 @@ def get_plan_price_for_user(user_id: int, plan_id: str) -> int:
     if not ref_link or not ref_link["custom_prices"]:
         return default_price
 
-    # Парсим кастомные цены
+    # Парсим кастомные цены (поддержка float)
     try:
-        custom_prices = [int(p.strip()) for p in ref_link["custom_prices"].split(",")]
+        custom_prices = [float(p.strip()) for p in ref_link["custom_prices"].split(",")]
         plan_ids = list(SUBSCRIPTION_PLANS.keys())
         plan_index = plan_ids.index(plan_id)
 

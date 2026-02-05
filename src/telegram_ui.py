@@ -57,12 +57,13 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def plans_kb(custom_prices: list[int] | None = None) -> InlineKeyboardMarkup:
+def plans_kb(custom_prices: list[float] | None = None) -> InlineKeyboardMarkup:
     """Создает клавиатуру с планами подписок.
 
     Args:
         custom_prices: список из 3 цен [price_1month, price_3months, price_forever]
                       Если None - используются дефолтные цены
+                      Поддерживаются float значения (35.5, 90.99)
     """
     buttons = []
     plan_ids = list(SUBSCRIPTION_PLANS.keys())
@@ -73,8 +74,11 @@ def plans_kb(custom_prices: list[int] | None = None) -> InlineKeyboardMarkup:
         else:
             price = plan['price']
 
+        # Форматируем цену: если целое число, показываем без .0
+        price_str = f"{price:.2f}".rstrip('0').rstrip('.') if isinstance(price, float) else str(price)
+
         buttons.append([InlineKeyboardButton(
-            text=f"{plan['label']} - {price}$",
+            text=f"{plan['label']} - {price_str}$",
             callback_data=f"plan:{plan_id}",
         )])
     buttons.append([InlineKeyboardButton(text="< Назад", callback_data="back_to_main")])
@@ -197,9 +201,9 @@ async def show_plans(callback: CallbackQuery) -> None:
         logger.info(f"Referral link data: {ref_link}")
 
         if ref_link and ref_link["custom_prices"]:
-            # Парсим кастомные цены из строки "35,90,200"
+            # Парсим кастомные цены из строки "35.5,90,200.99" (поддержка float)
             try:
-                custom_prices = [int(p.strip()) for p in ref_link["custom_prices"].split(",")]
+                custom_prices = [float(p.strip()) for p in ref_link["custom_prices"].split(",")]
                 logger.info(f"✓ Applying custom prices for user {user.id}: {custom_prices}")
             except ValueError:
                 logger.warning(f"Failed to parse custom prices: {ref_link['custom_prices']}")

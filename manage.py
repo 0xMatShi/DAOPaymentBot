@@ -332,15 +332,15 @@ def menu_new_referral() -> None:
 
     # 2. Кастомные цены
     custom_prices_str = inquirer.text(  # type: ignore
-        message="Кастомные цены через запятую (например: 35,90,200) или пустое для дефолтных:",
+        message="Кастомные цены через запятую (например: 35.5,90,200.99) или пустое для дефолтных:",
         default=""
     ).execute()
 
     custom_prices = None
     if custom_prices_str.strip():
         try:
-            # Проверяем формат
-            prices = [int(p.strip()) for p in custom_prices_str.split(",")]
+            # Проверяем формат (поддержка float)
+            prices = [float(p.strip()) for p in custom_prices_str.split(",")]
             if len(prices) != 3:
                 print("\n❌ Нужно указать ровно 3 цены (для 1мес, 3мес, навсегда). Отмена.\n")
                 inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore

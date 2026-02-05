@@ -356,7 +356,7 @@ def menu_new_referral() -> None:
     code = create_referral_link(max_uses, custom_prices)
 
     # Формируем ссылку (нужно будет вставить username бота вручную)
-    referral_url = f"https://t.me/YOUR_BOT_USERNAME?start={code}"
+    referral_url = f"https://t.me/ANdexDAOPaymentBot?start={code}"
 
     # Сохраняем в файл
     os.makedirs("data", exist_ok=True)

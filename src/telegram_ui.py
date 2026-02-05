@@ -129,25 +129,29 @@ async def cmd_start_with_referral(message: Message, state: FSMContext) -> None:
     args = message.text.split(maxsplit=1)  # type: ignore
     referral_code = args[1] if len(args) > 1 else None
 
-    logger.info(f"User {user.id} started the bot with referral code: {referral_code}")
+    logger.info(f"User {user.id} started the bot with referral code: {referral_code}")  # type: ignore
 
     # Сохраняем/обновляем профиль пользователя
-    update_user_profile(user.id, user.username, user.first_name, user.last_name)
+    update_user_profile(user.id, user.username, user.first_name, user.last_name) # type: ignore
 
     # Пытаемся использовать реферальную ссылку
     if referral_code:
         ref_link = get_referral_link(referral_code)
+        logger.info(f"Referral link lookup: {ref_link}")
+
         if ref_link and ref_link["is_active"]:
-            success = use_referral_link(user.id, referral_code)
+            success = use_referral_link(user.id, referral_code) # type: ignore
             if success:
-                logger.info(f"User {user.id} successfully used referral code {referral_code}")
+                logger.info(f"✓ User {user.id} successfully used referral code {referral_code}") # type: ignore
             else:
-                logger.warning(f"User {user.id} failed to use referral code {referral_code}")
+                logger.warning(f"✗ User {user.id} failed to use referral code {referral_code} (already used or limit reached)") # type: ignore
+        else:
+            logger.warning(f"✗ Referral link {referral_code} not found or inactive")
 
     # Очищаем FSM при рестарте
     await state.clear()
 
-    cancel_user_payment_sessions(user.id)
+    cancel_user_payment_sessions(user.id) # type: ignore
     await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_kb())
 
 
@@ -155,15 +159,15 @@ async def cmd_start_with_referral(message: Message, state: FSMContext) -> None:
 async def cmd_start(message: Message, state: FSMContext) -> None:
     """Обработка обычного старта без параметров."""
     user = message.from_user  # type: ignore
-    logger.info(f"User {user.id} started the bot")
+    logger.info(f"User {user.id} started the bot") # type: ignore
 
     # Сохраняем/обновляем профиль пользователя
-    update_user_profile(user.id, user.username, user.first_name, user.last_name)
+    update_user_profile(user.id, user.username, user.first_name, user.last_name) # type: ignore
 
     # Очищаем FSM при рестарте
     await state.clear()
 
-    cancel_user_payment_sessions(user.id)
+    cancel_user_payment_sessions(user.id) # type: ignore
     await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_kb())
 
 
@@ -185,15 +189,23 @@ async def show_plans(callback: CallbackQuery) -> None:
     # Проверяем, есть ли у пользователя реферальный код с кастомными ценами
     custom_prices = None
     referral_code = get_user_referral_code(user.id)
+    logger.info(f"Checking referral code for user {user.id}: {referral_code}")
+
     if referral_code:
         ref_link = get_referral_link(referral_code)
+        logger.info(f"Referral link data: {ref_link}")
+
         if ref_link and ref_link["custom_prices"]:
             # Парсим кастомные цены из строки "35,90,200"
             try:
                 custom_prices = [int(p.strip()) for p in ref_link["custom_prices"].split(",")]
-                logger.info(f"Applying custom prices for user {user.id}: {custom_prices}")
+                logger.info(f"✓ Applying custom prices for user {user.id}: {custom_prices}")
             except ValueError:
                 logger.warning(f"Failed to parse custom prices: {ref_link['custom_prices']}")
+        else:
+            logger.info(f"No custom prices for referral code {referral_code}")
+    else:
+        logger.info(f"No referral code for user {user.id}")
 
     await callback.message.edit_text( # type: ignore
         "Выберите одну из предложенных подписок:",

@@ -14,7 +14,7 @@ DB_PATH = "data/bot.db"
 PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
 
 SUBSCRIPTION_PLANS = {
-    "1month": {"label": "1 месяц", "price": 0.1, "duration_days": 30},
+    "1month": {"label": "1 месяц", "price": 50, "duration_days": 30},
     "3months": {"label": "3 месяца", "price": 120, "duration_days": 90},
     "forever": {"label": "Навсегда", "price": 250, "duration_days": None},
 }
@@ -373,6 +373,7 @@ def use_referral_link(user_id: int, code: str) -> bool:
         (user_id, code)
     )
     if cursor.fetchone():
+        logger.info(f"User {user_id} already used referral code {code}")
         conn.close()
         return False  # Уже использовал
 
@@ -383,15 +384,22 @@ def use_referral_link(user_id: int, code: str) -> bool:
     )
     row = cursor.fetchone()
 
-    if not row or not row["is_active"]:
+    if not row:
+        logger.warning(f"Referral link {code} not found in database")
         conn.close()
-        return False  # Ссылка не найдена или неактивна
+        return False
+
+    if not row["is_active"]:
+        logger.warning(f"Referral link {code} is inactive")
+        conn.close()
+        return False
 
     max_uses = row["max_uses"]
     current_uses = row["current_uses"]
 
     # Проверяем лимит
     if max_uses is not None and current_uses >= max_uses:
+        logger.warning(f"Referral link {code} limit reached: {current_uses}/{max_uses}")
         conn.close()
         return False  # Лимит исчерпан
 
@@ -410,7 +418,7 @@ def use_referral_link(user_id: int, code: str) -> bool:
     conn.commit()
     conn.close()
 
-    logger.info(f"Referral link used: user={user_id}, code={code}")
+    logger.info(f"✓ Referral link used: user={user_id}, code={code}")
     return True
 
 

@@ -15,7 +15,7 @@ PRIVATE_CHAT_ID = int(os.getenv("PRIVATE_CHAT_ID", "0"))
 PRIVATE_GROUP_ID = int(os.getenv("PRIVATE_GROUP_ID", "0"))  # Используем имя переменной с опечаткой из .env
 
 SUBSCRIPTION_PLANS = {
-    "1month": {"label": "1 месяц", "price": 0.1, "duration_days": 30},
+    "1month": {"label": "1 месяц", "price": 50, "duration_days": 30},
     "3months": {"label": "3 месяца", "price": 120, "duration_days": 90},
     "forever": {"label": "Навсегда", "price": 250, "duration_days": None},
 }
@@ -854,14 +854,14 @@ def activate_subscription(user_id: int, plan: str) -> None:
     conn.close()
     logger.info(f"Activated subscription '{plan}' for user {user_id}")
 
-    # Начисляем 3 дня владельцу реферальной ссылки, если пользователь пришёл по чьей-то ссылке
+    # Начисляем 7 дней владельцу реферальной ссылки, если пользователь пришёл по чьей-то ссылке
     referral_code = get_user_referral_code(user_id)
     if referral_code:
         owner_id = get_referral_link_owner(referral_code)
         if owner_id:
-            success = add_days_to_subscription(owner_id, 3)
+            success = add_days_to_subscription(owner_id, 7)
             if success:
-                logger.info(f"✓ Awarded 3 days to referral link owner {owner_id} (referrer of user {user_id})")
+                logger.info(f"✓ Awarded 7 days to referral link owner {owner_id} (referrer of user {user_id})")
             else:
                 logger.info(f"Referral link owner {owner_id} has no active subscription, skipping reward")
 

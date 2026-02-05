@@ -39,12 +39,13 @@ from src.payments import (
 
 router = Router()
 
-MAIN_MENU_TEXT = "Главное меню\n\nДобро пожаловать! Выберите действие:"
-
-FAQ_TEXT = (
-    "FAQ\n\n"
-    "Здесь будет информация о часто задаваемых вопросах.\n\n"
-    "(Текст будет дополнен позже)"
+MAIN_MENU_TEXT = (
+    "Приветствую, боец. Ты уже участник DAO, осталась маленькая формальность в виде оплаты\n\n"
+    "Выбирай подписку и получай доступ ко всем ресурсам\n"
+    "Личный кабинет даст информацию о подписке\n"
+    "А на любой вопрос я готов ответить в личке\n\n"
+    "Ждем тебя среди сильнейших 💪🏻\n\n"
+    "Выбирай нужное действие в меню ниже 👇🏻"
 )
 
 
@@ -55,7 +56,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Оплатить подписку", callback_data="subscribe")],
         [InlineKeyboardButton(text="Личный кабинет", callback_data="profile")],
-        [InlineKeyboardButton(text="FAQ", callback_data="faq")],
+        [InlineKeyboardButton(text="Задать вопрос", url="https://t.me/aNd3x")],
     ])
 
 
@@ -87,34 +88,38 @@ def plans_kb(custom_prices: list[float] | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def network_kb(plan_id: str) -> InlineKeyboardMarkup:
+def token_kb(plan_id: str) -> InlineKeyboardMarkup:
+    """Клавиатура выбора токена (монеты)."""
     buttons = []
-    for net_id, net in SUPPORTED_NETWORKS.items():
+    for token_id, token in SUPPORTED_TOKENS.items():
         buttons.append([InlineKeyboardButton(
-            text=net["name"],
-            callback_data=f"net:{plan_id}:{net_id}",
+            text=token["name"],
+            callback_data=f"token:{plan_id}:{token_id}",
         )])
     buttons.append([InlineKeyboardButton(text="< Назад", callback_data="subscribe")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def token_kb(plan_id: str, network: str) -> InlineKeyboardMarkup:
+def network_kb(plan_id: str, token: str) -> InlineKeyboardMarkup:
+    """Клавиатура выбора сети с учетом выбранного токена."""
     buttons = []
-    for token_id, token in SUPPORTED_TOKENS.items():
-        if network not in token["addresses"]:
-            continue
-        buttons.append([InlineKeyboardButton(
-            text=token["name"],
-            callback_data=f"token:{plan_id}:{network}:{token_id}",
-        )])
+    token_info = SUPPORTED_TOKENS.get(token)
+    if token_info:
+        for net_id, net in SUPPORTED_NETWORKS.items():
+            # Показываем только сети, в которых доступен выбранный токен
+            if net_id in token_info["addresses"]:
+                buttons.append([InlineKeyboardButton(
+                    text=net["name"],
+                    callback_data=f"net:{plan_id}:{token}:{net_id}",
+                )])
     buttons.append([InlineKeyboardButton(text="< Назад", callback_data=f"plan:{plan_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def payment_kb(plan_id: str, network: str, token: str) -> InlineKeyboardMarkup:
+def payment_kb(plan_id: str, token: str, network: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Подтвердить оплату", callback_data=f"confirm:{plan_id}:{network}:{token}")],
-        [InlineKeyboardButton(text="< Назад", callback_data=f"net:{plan_id}:{network}")],
+        [InlineKeyboardButton(text="Подтвердить оплату", callback_data=f"confirm:{plan_id}:{token}:{network}")],
+        [InlineKeyboardButton(text="< Назад", callback_data=f"token:{plan_id}:{token}")],
     ])
 
 
@@ -222,7 +227,8 @@ async def show_plans(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("plan:"))
-async def show_network_selection(callback: CallbackQuery) -> None:
+async def show_token_selection(callback: CallbackQuery) -> None:
+    """Показывает выбор токена (монеты) после выбора плана."""
     plan_id = callback.data.split(":")[1]  # type: ignore
     plan = SUBSCRIPTION_PLANS.get(plan_id)
     if not plan:
@@ -250,18 +256,19 @@ async def show_network_selection(callback: CallbackQuery) -> None:
     logger.info(f"User {user_id} selected plan {plan_id}, price: {price}")
     await callback.message.edit_text(  # type: ignore
         f"Оплата подписки: {plan['label']} - {price_str}$\n\n"
-        f"Выберите сеть для перевода:",
-        reply_markup=network_kb(plan_id),
+        f"Выберите монету для оплаты:",
+        reply_markup=token_kb(plan_id),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("net:"))
-async def show_token_selection(callback: CallbackQuery) -> None:
-    _, plan_id, network = callback.data.split(":")  # type: ignore
+@router.callback_query(F.data.regexp(r"^token:[^:]+:[^:]+$"))
+async def show_network_selection(callback: CallbackQuery) -> None:
+    """Показывает выбор сети после выбора токена."""
+    _, plan_id, token = callback.data.split(":")  # type: ignore
     plan = SUBSCRIPTION_PLANS.get(plan_id)
-    net = SUPPORTED_NETWORKS.get(network)
-    if not plan or not net:
+    tok = SUPPORTED_TOKENS.get(token)
+    if not plan or not tok:
         await callback.answer("Неизвестный параметр", show_alert=True)
         return
 
@@ -272,19 +279,25 @@ async def show_token_selection(callback: CallbackQuery) -> None:
     price = get_plan_price_for_user(user_id, plan_id)
     price_str = f"{price:.2f}".rstrip('0').rstrip('.') if isinstance(price, float) else str(price)
 
-    logger.info(f"User {user_id} selected network {network}")
+    logger.info(f"User {user_id} selected token {token}")
     await callback.message.edit_text(  # type: ignore
         f"Оплата подписки: {plan['label']} - {price_str}$\n"
-        f"Сеть: {net['name']}\n\n"
-        f"Выберите токен для оплаты:",
-        reply_markup=token_kb(plan_id, network),
+        f"Монета: {tok['name']}\n\n"
+        f"Выберите сеть для перевода:",
+        reply_markup=network_kb(plan_id, token),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("token:"))
+@router.callback_query(F.data.startswith("net:"))
 async def show_payment(callback: CallbackQuery, state: FSMContext) -> None:
-    _, plan_id, network, token = callback.data.split(":")  # type: ignore
+    """Показывает платежную информацию после выбора сети."""
+    parts = callback.data.split(":")  # type: ignore
+    if len(parts) != 4:  # net:plan_id:token:network
+        await callback.answer("Неизвестный параметр", show_alert=True)
+        return
+
+    _, plan_id, token, network = parts
     plan = SUBSCRIPTION_PLANS.get(plan_id)
     net = SUPPORTED_NETWORKS.get(network)
     tok = SUPPORTED_TOKENS.get(token)
@@ -326,7 +339,7 @@ async def show_payment(callback: CallbackQuery, state: FSMContext) -> None:
     logger.info(f"User {user_id} selected {tok['name']} on {net['name']}, master wallet: {wallet_address}")
     await callback.message.edit_text(  # type: ignore
         text,
-        reply_markup=payment_kb(plan_id, network, token),
+        reply_markup=payment_kb(plan_id, token, network),
         parse_mode=ParseMode.HTML,
     )
     await callback.answer()
@@ -335,7 +348,12 @@ async def show_payment(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("confirm:"))
 async def confirm_payment_handler(callback: CallbackQuery, state: FSMContext) -> None:
     """Хендлер кнопки 'Подтвердить оплату' - переводит в режим ожидания хэша."""
-    _, plan_id, network, token = callback.data.split(":")  # type: ignore
+    parts = callback.data.split(":")  # type: ignore
+    if len(parts) != 4:  # confirm:plan_id:token:network
+        await callback.answer("Ошибка формата данных", show_alert=True)
+        return
+
+    _, plan_id, token, network = parts
     user_id = callback.from_user.id
 
     plan = SUBSCRIPTION_PLANS.get(plan_id, {})
@@ -352,15 +370,15 @@ async def confirm_payment_handler(callback: CallbackQuery, state: FSMContext) ->
     text = (
         f"Отправьте хэш транзакции для подтверждения оплаты.\n\n"
         f"План: {plan.get('label', plan_id)}\n"
-        f"Сеть: {net.get('name', network)}\n"
-        f"Токен: {tok.get('name', token)}\n\n"
+        f"Монета: {tok.get('name', token)}\n"
+        f"Сеть: {net.get('name', network)}\n\n"
         f"Отмена: /start"
     )
 
     await callback.message.edit_text(text, reply_markup=None)  # type: ignore
     await state.set_state(PaymentStates.waiting_for_tx_hash)
     await callback.answer()
-    logger.info(f"User {user_id} entered tx hash input mode for {plan_id}/{network}/{token}")
+    logger.info(f"User {user_id} entered tx hash input mode for {plan_id}/{token}/{network}")
 
 
 @router.message(PaymentStates.waiting_for_tx_hash, F.text)
@@ -524,7 +542,7 @@ async def show_profile(callback: CallbackQuery) -> None:
             bot_info = await callback.bot.get_me() # type: ignore
             bot_username = bot_info.username if bot_info and bot_info.username else "PaymentDAOBot"
             referral_url = f"https://t.me/{bot_username}?start={own_referral_code}"
-            referral_text = f"\n\n🔗 Ваша реферальная ссылка:\n<code>{referral_url}</code>\n\nПриглашайте друзей и получайте +3 дня к подписке за каждую оплату!"
+            referral_text = f"\n\n🔗 Ваша реферальная ссылка:\n<code>{referral_url}</code>\n\nПриглашайте друзей и получайте +7 дней к подписке за каждую оплату!"
 
     text = (
         f"Личный кабинет\n\n"
@@ -538,11 +556,6 @@ async def show_profile(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data == "faq")
-async def show_faq(callback: CallbackQuery) -> None:
-    logger.info(f"User {callback.from_user.id} opened FAQ")
-    await callback.message.edit_text(FAQ_TEXT, reply_markup=back_kb()) # type: ignore
-    await callback.answer()
 
 
 # ── Настройка команд бота ───────────────────────────────────

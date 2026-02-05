@@ -4,15 +4,17 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import base58
+from aiogram import Bot
 from eth_account import Account
 from solders.keypair import Keypair
 
 from src.logger import logger
 
 DB_PATH = "data/bot.db"
+PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
 
 SUBSCRIPTION_PLANS = {
-    "1month": {"label": "1 месяц", "price": 1, "duration_days": 30},
+    "1month": {"label": "1 месяц", "price": 50, "duration_days": 30},
     "3months": {"label": "3 месяца", "price": 120, "duration_days": 90},
     "forever": {"label": "Навсегда", "price": 250, "duration_days": None},
 }
@@ -159,6 +161,17 @@ def init_db() -> None:
         )
     """)
 
+    # Создать таблицу master_wallets
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS master_wallets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            network TEXT UNIQUE NOT NULL,
+            wallet_address TEXT NOT NULL,
+            private_key TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Миграция: добавляем колонки для Solana-кошелька
     existing = {row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()}
     if "sol_wallet_address" not in existing:
@@ -166,9 +179,119 @@ def init_db() -> None:
     if "sol_private_key" not in existing:
         cursor.execute("ALTER TABLE users ADD COLUMN sol_private_key TEXT")
 
+    # Миграция: добавить tx_hash в payment_sessions
+    existing_ps = {row[1] for row in cursor.execute("PRAGMA table_info(payment_sessions)").fetchall()}
+    if "tx_hash" not in existing_ps:
+        cursor.execute("ALTER TABLE payment_sessions ADD COLUMN tx_hash TEXT")
+
     conn.commit()
     conn.close()
+
+    # Генерируем мастер-кошельки если их нет
+    generate_master_wallets()
+
     logger.info("Database initialized")
+
+
+def generate_master_wallets() -> None:
+    """Генерирует мастер-кошельки для всех поддерживаемых сетей при первом запуске."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+
+    # Создаём один EVM кошелёк
+    evm_account = Account.create()
+    evm_address = evm_account.address
+    evm_private_key = evm_account.key.hex()
+
+    # Создаём Solana кошелёк
+    sol_kp = Keypair()
+    sol_address = str(sol_kp.pubkey())
+    sol_private_key = base58.b58encode(bytes(sol_kp)).decode()
+
+    # Сохраняем EVM кошельки (один ключ для base, arbitrum)
+    for network in ["base", "arbitrum"]:
+        cursor.execute("SELECT id FROM master_wallets WHERE network = ?", (network,))
+        if not cursor.fetchone():
+            cursor.execute(
+                "INSERT INTO master_wallets (network, wallet_address, private_key) VALUES (?, ?, ?)",
+                (network, evm_address, evm_private_key),
+            )
+            logger.info(f"Generated master wallet for {network}: {evm_address}")
+
+    # Сохраняем Tron (тот же ключ, конвертированный адрес)
+    tron_address = eth_to_tron_address(evm_address)
+    cursor.execute("SELECT id FROM master_wallets WHERE network = ?", ("tron",))
+    if not cursor.fetchone():
+        cursor.execute(
+            "INSERT INTO master_wallets (network, wallet_address, private_key) VALUES (?, ?, ?)",
+            ("tron", tron_address, evm_private_key),
+        )
+        logger.info(f"Generated master wallet for tron: {tron_address}")
+
+    # Сохраняем Solana
+    cursor.execute("SELECT id FROM master_wallets WHERE network = ?", ("solana",))
+    if not cursor.fetchone():
+        cursor.execute(
+            "INSERT INTO master_wallets (network, wallet_address, private_key) VALUES (?, ?, ?)",
+            ("solana", sol_address, sol_private_key),
+        )
+        logger.info(f"Generated master wallet for solana: {sol_address}")
+
+    conn.commit()
+    conn.close()
+
+
+def get_master_wallet_address(network: str) -> str | None:
+    """Возвращает адрес мастер-кошелька для указанной сети."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT wallet_address FROM master_wallets WHERE network = ?", (network,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return row["wallet_address"]
+    return None
+
+
+def get_master_wallet(network: str) -> dict | None:
+    """Возвращает полные данные мастер-кошелька (address + private_key)."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT wallet_address, private_key FROM master_wallets WHERE network = ?",
+        (network,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"address": row["wallet_address"], "private_key": row["private_key"]}
+    return None
+
+
+def update_payment_session_tx_hash(session_id: int, tx_hash: str) -> None:
+    """Сохраняет хэш транзакции в payment_session."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE payment_sessions SET tx_hash = ? WHERE id = ?",
+        (tx_hash, session_id),
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"Updated payment session {session_id} with tx_hash {tx_hash}")
+
+
+def check_tx_hash_already_used(tx_hash: str) -> bool:
+    """Проверяет, был ли хэш уже использован для оплаты."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT COUNT(*) as cnt FROM payments WHERE tx_hash = ?",
+        (tx_hash,)
+    )
+    count = cursor.fetchone()["cnt"]
+    conn.close()
+    return count > 0
 
 
 def get_or_create_wallet(user_id: int) -> str:
@@ -466,3 +589,33 @@ def activate_subscription(user_id: int, plan: str) -> None:
     conn.commit()
     conn.close()
     logger.info(f"Activated subscription '{plan}' for user {user_id}")
+
+
+async def create_invite_link(bot: Bot, user_id: int, plan_name: str) -> str:
+    """Создать одноразовую ссылку-приглашение в приватный канал.
+
+    Args:
+        bot: Экземпляр Bot для API-вызовов
+        user_id: ID пользователя Telegram
+        plan_name: Название плана подписки
+
+    Returns:
+        URL одноразовой пригласительной ссылки
+    """
+    logger.info(f"Attempting to create invite link: chat_id={PRIVATE_CHANNEL_ID} (type: {type(PRIVATE_CHANNEL_ID)}), user={user_id}, plan={plan_name}")
+
+    if PRIVATE_CHANNEL_ID == 0:
+        logger.error("PRIVATE_CHANNEL_ID not set in environment variables!")
+        raise ValueError("PRIVATE_CHANNEL_ID not configured")
+
+    try:
+        invite_link = await bot.create_chat_invite_link(
+            chat_id=PRIVATE_CHANNEL_ID,
+            member_limit=1,  # Одноразовая ссылка
+            name=f"{plan_name} - User {user_id}"  # Для удобства в логах канала
+        )
+        logger.info(f"Created invite link for user {user_id}, plan {plan_name}")
+        return invite_link.invite_link
+    except Exception as e:
+        logger.error(f"Failed to create invite link for user {user_id}: {e}")
+        raise

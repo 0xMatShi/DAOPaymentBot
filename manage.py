@@ -204,24 +204,65 @@ def menu_users() -> None:
         show_user_detail(user)
 
 
-def menu_export_wallets() -> None:
+def menu_view_master_wallets() -> None:
+    """Просмотр мастер-кошельков без экспорта."""
     clear()
-    users = get_all_users()
-    if not users:
-        print("Пользователей пока нет. Нечего экспортировать.\n")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT network, wallet_address FROM master_wallets ORDER BY network"
+    )
+    wallets = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    if not wallets:
+        print("Мастер-кошельки не найдены.\n")
+        inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+        return
+
+    print("=" * 80)
+    print("МАСТЕР-КОШЕЛЬКИ (адреса)")
+    print("=" * 80)
+    for w in wallets:
+        print(f"{w['network']:12} | {w['wallet_address']}")
+    print("=" * 80 + "\n")
+
+    inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+
+
+def menu_export_wallets() -> None:
+    """Экспортирует только мастер-кошельки."""
+    clear()
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT network, wallet_address, private_key FROM master_wallets ORDER BY network"
+    )
+    wallets = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    if not wallets:
+        print("Мастер-кошельки не найдены.\n")
+        inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
         return
 
     os.makedirs("data", exist_ok=True)
-    filepath = "data/wallets_export.txt"
+    filepath = "data/master_wallets_export.txt"
 
     with open(filepath, "w", encoding="utf-8") as f:
-        for i, u in enumerate(users, 1):
-            erc_key = u["private_key"]
-            trc_key = erc_key  # Tron использует тот же secp256k1 ключ
-            sol_key = u.get("sol_private_key") or "N/A"
-            f.write(f"{i}. {u['user_id']} | {erc_key} | {trc_key} | {sol_key}\n")
+        f.write("=== MASTER WALLETS ===\n")
+        f.write("ВНИМАНИЕ: Храните этот файл в безопасном месте!\n\n")
+        for w in wallets:
+            f.write(f"Сеть: {w['network']}\n")
+            f.write(f"Адрес: {w['wallet_address']}\n")
+            f.write(f"Приватный ключ: {w['private_key']}\n")
+            f.write("-" * 80 + "\n")
 
-    print(f"\nЭкспортировано {len(users)} кошельков в {filepath}\n")
+    print(f"\nЭкспортировано {len(wallets)} мастер-кошельков в {filepath}\n")
+    print("⚠️  ВАЖНО: Этот файл содержит приватные ключи. Удалите его после сохранения в безопасное место!")
+    inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
 
 
 def main() -> None:
@@ -229,12 +270,14 @@ def main() -> None:
     while True:
         action = inquirer.select( # type: ignore
             message="Управление ботом:",
-            choices=["Users", "Export Wallets", "Exit"],
+            choices=["Users", "View Master Wallets", "Export Master Wallets", "Exit"],
         ).execute()
 
         if action == "Users":
             menu_users()
-        elif action == "Export Wallets":
+        elif action == "View Master Wallets":
+            menu_view_master_wallets()
+        elif action == "Export Master Wallets":
             menu_export_wallets()
         elif action == "Exit":
             break

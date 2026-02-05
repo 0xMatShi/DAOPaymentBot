@@ -2,6 +2,10 @@ import asyncio
 import os
 
 from dotenv import load_dotenv
+
+# ВАЖНО: загружаем .env до импорта модулей, которые используют переменные окружения
+load_dotenv()
+
 from aiogram import Bot, Dispatcher
 
 from src.logger import logger
@@ -33,12 +37,13 @@ async def check_expired_subscriptions(bot: Bot) -> None:
 
 
 async def main() -> None:
-    load_dotenv()
-
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN not found in .env")
         return
+
+    channel_id = os.getenv("PRIVATE_CHANNEL_ID")
+    logger.info(f"Loaded PRIVATE_CHANNEL_ID from .env: {channel_id}")
 
     init_db()
 

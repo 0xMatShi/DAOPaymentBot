@@ -286,3 +286,300 @@ async def scan_incoming_transfers(
     if result:
         logger.info(f"Found {len(result)} transfer(s) to {wallet} on {network}")
     return result
+
+
+# ── Проверка транзакций по хэшу ───────────────────────────────
+
+
+def validate_tx_hash_format(network: str, tx_hash: str) -> tuple[bool, str]:
+    """Проверяет формат хэша транзакции для конкретной сети.
+
+    Returns:
+        (is_valid, error_message)
+    """
+    from src.payments import SUPPORTED_NETWORKS
+
+    net_info = SUPPORTED_NETWORKS.get(network)
+    if not net_info:
+        return False, "Неизвестная сеть"
+
+    net_type = net_info.get("type")
+
+    if net_type in ["evm", "tron"]:
+        # EVM и Tron: 0x + 64 hex chars (32 bytes)
+        if not tx_hash.startswith("0x"):
+            return False, "Хэш должен начинаться с '0x'"
+        if len(tx_hash) != 66:  # 0x + 64 chars
+            return False, f"Неверная длина хэша (ожидается 66 символов, получено {len(tx_hash)})"
+        try:
+            int(tx_hash, 16)  # Проверка hex
+        except ValueError:
+            return False, "Хэш содержит недопустимые символы (только 0-9, a-f)"
+        return True, ""
+
+    elif net_type == "solana":
+        # Solana: base58-encoded signature (обычно 87-88 символов)
+        if len(tx_hash) < 80 or len(tx_hash) > 90:
+            return False, f"Неверная длина подписи (ожидается 80-90 символов, получено {len(tx_hash)})"
+        try:
+            import base58
+            base58.b58decode(tx_hash)
+        except Exception:
+            return False, "Неверный формат base58"
+        return True, ""
+
+    return False, "Неподдерживаемый тип сети"
+
+
+async def verify_evm_transaction(
+    network: str,
+    tx_hash: str,
+    expected_to: str,
+    expected_token: str,
+    min_amount: float,
+    decimals: int,
+) -> tuple[bool, str, float]:
+    """Проверяет EVM транзакцию по хэшу.
+
+    Returns:
+        (is_valid, error_message, amount)
+    """
+    try:
+        data = await _rpc_call(network, "eth_getTransactionReceipt", [tx_hash])
+    except RuntimeError as e:
+        logger.error(f"Failed to get tx receipt: {e}")
+        return False, "Не удалось получить данные о транзакции из сети", 0.0
+
+    receipt = data.get("result")
+    if not receipt:
+        return False, "Транзакция не найдена или ещё не подтверждена", 0.0
+
+    # Проверяем статус (success)
+    status = receipt.get("status")
+    if status != "0x1":
+        return False, "Транзакция завершилась с ошибкой", 0.0
+
+    # Проверяем адрес контракта токена
+    logs = receipt.get("logs", [])
+    transfer_found = False
+    total_amount = 0
+
+    expected_to_padded = "0x" + expected_to[2:].lower().zfill(64)
+
+    for log_entry in logs:
+        if log_entry.get("address", "").lower() != expected_token.lower():
+            continue
+        topics = log_entry.get("topics", [])
+        if len(topics) < 3:
+            continue
+        if topics[0] != TRANSFER_EVENT_TOPIC:
+            continue
+        # topics[2] - получатель (to)
+        if topics[2].lower() != expected_to_padded.lower():
+            continue
+
+        # Парсим amount
+        raw_amount = int(log_entry["data"], 16)
+        total_amount += raw_amount
+        transfer_found = True
+
+    if not transfer_found:
+        return False, f"Перевод на адрес {expected_to} не найден в транзакции", 0.0
+
+    amount = total_amount / (10 ** decimals)
+
+    if amount < min_amount:
+        return False, f"Недостаточная сумма ({amount} < {min_amount})", amount
+
+    return True, "", amount
+
+
+async def verify_tron_transaction(
+    network: str,
+    tx_hash: str,
+    expected_to: str,
+    expected_token: str,
+    min_amount: float,
+    decimals: int,
+) -> tuple[bool, str, float]:
+    """Проверяет Tron TRC-20 транзакцию по хэшу.
+
+    Returns:
+        (is_valid, error_message, amount)
+    """
+    url = _get_trongrid_url(network)
+    api_key = os.getenv("TRONGRID_API_KEY", "")
+    headers = {}
+    if api_key:
+        headers["TRON-PRO-API-KEY"] = api_key
+
+    # Убираем 0x prefix если есть
+    tx_id = tx_hash[2:] if tx_hash.startswith("0x") else tx_hash
+
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(
+                f"{url}/v1/transactions/{tx_id}",
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 404:
+                    return False, "Транзакция не найдена", 0.0
+                data = await resp.json()
+    except Exception as e:
+        logger.error(f"Failed to get Tron tx: {e}")
+        return False, "Ошибка при запросе к сети Tron", 0.0
+
+    # Проверяем успешность
+    ret = data.get("ret", [])
+    if not ret or ret[0].get("contractRet") != "SUCCESS":
+        return False, "Транзакция не успешна", 0.0
+
+    # Парсим contract calls
+    contract = data.get("raw_data", {}).get("contract", [])
+    if not contract:
+        return False, "Некорректная структура транзакции", 0.0
+
+    parameter = contract[0].get("parameter", {}).get("value", {})
+    to_address = parameter.get("to")
+    amount_raw = parameter.get("amount", 0)
+
+    if not to_address:
+        return False, "Отсутствуют данные о получателе", 0.0
+
+    # Сравниваем адреса (base58)
+    if to_address != expected_to:
+        return False, f"Получатель не совпадает (ожидается {expected_to})", 0.0
+
+    amount = amount_raw / (10 ** decimals)
+
+    if amount < min_amount:
+        return False, f"Недостаточная сумма ({amount} < {min_amount})", amount
+
+    return True, "", amount
+
+
+async def verify_solana_transaction(
+    network: str,
+    signature: str,
+    expected_to: str,
+    expected_token_mint: str,
+    min_amount: float,
+    decimals: int,
+) -> tuple[bool, str, float]:
+    """Проверяет Solana SPL-токен транзакцию по подписи.
+
+    Returns:
+        (is_valid, error_message, amount)
+    """
+    url = _get_rpc_url(network)
+    ata = _get_associated_token_address(expected_to, expected_token_mint)
+
+    try:
+        tx_data = await _solana_rpc_call(url, "getTransaction", [
+            signature,
+            {
+                "encoding": "jsonParsed",
+                "maxSupportedTransactionVersion": 0,
+                "commitment": "confirmed"
+            },
+        ])
+    except RuntimeError as e:
+        logger.error(f"Failed to get Solana tx: {e}")
+        return False, "Не удалось получить транзакцию из сети Solana", 0.0
+
+    tx = tx_data.get("result")
+    if not tx:
+        return False, "Транзакция не найдена или ещё не подтверждена", 0.0
+
+    # Проверяем статус
+    if tx.get("meta", {}).get("err"):
+        return False, "Транзакция завершилась с ошибкой", 0.0
+
+    # Парсим сумму
+    amount_raw = _parse_solana_spl_transfer(tx, ata)
+
+    if amount_raw == 0:
+        return False, f"Перевод на кошелёк {expected_to} не найден", 0.0
+
+    amount = amount_raw / (10 ** decimals)
+
+    if amount < min_amount:
+        return False, f"Недостаточная сумма ({amount} < {min_amount})", amount
+
+    return True, "", amount
+
+
+async def verify_transaction_by_hash(
+    tx_hash: str,
+    network: str,
+    token: str,
+    plan: str,
+) -> tuple[bool, str, float]:
+    """Универсальная функция проверки транзакции по хэшу.
+
+    Args:
+        tx_hash: Хэш транзакции (EVM/Tron) или подпись (Solana)
+        network: ID сети ('base', 'arbitrum', 'tron', 'solana')
+        token: ID токена ('usdc', 'usdt')
+        plan: ID плана для проверки суммы
+
+    Returns:
+        (is_valid, error_message, amount)
+    """
+    from src.payments import (
+        SUBSCRIPTION_PLANS,
+        SUPPORTED_TOKENS,
+        SUPPORTED_NETWORKS,
+        get_master_wallet_address,
+        check_tx_hash_already_used,
+        eth_to_tron_address,
+    )
+
+    # Валидация формата
+    is_valid_format, format_error = validate_tx_hash_format(network, tx_hash)
+    if not is_valid_format:
+        return False, format_error, 0.0
+
+    # Проверка повторного использования
+    if check_tx_hash_already_used(tx_hash):
+        return False, "Этот хэш транзакции уже был использован", 0.0
+
+    # Получаем параметры
+    plan_info = SUBSCRIPTION_PLANS.get(plan)
+    token_info = SUPPORTED_TOKENS.get(token)
+    net_info = SUPPORTED_NETWORKS.get(network)
+
+    if not plan_info or not token_info or not net_info:
+        return False, "Неверные параметры плана/токена/сети", 0.0
+
+    min_amount = plan_info["price"]
+    decimals = token_info["decimals"]
+    token_address = token_info["addresses"].get(network)
+
+    if not token_address:
+        return False, f"Токен {token} не поддерживается в сети {network}", 0.0
+
+    # Получаем адрес мастер-кошелька
+    master_wallet = get_master_wallet_address(network)
+    if not master_wallet:
+        return False, "Мастер-кошелёк не найден", 0.0
+
+    # Вызываем специфичную функцию
+    net_type = net_info.get("type")
+
+    if net_type == "evm":
+        return await verify_evm_transaction(
+            network, tx_hash, master_wallet, token_address, min_amount, decimals
+        )
+    elif net_type == "tron":
+        # Для Tron конвертируем адрес если нужно
+        tron_address = eth_to_tron_address(master_wallet) if not master_wallet.startswith("T") else master_wallet
+        return await verify_tron_transaction(
+            network, tx_hash, tron_address, token_address, min_amount, decimals
+        )
+    elif net_type == "solana":
+        return await verify_solana_transaction(
+            network, tx_hash, master_wallet, token_address, min_amount, decimals
+        )
+
+    return False, "Неподдерживаемый тип сети", 0.0

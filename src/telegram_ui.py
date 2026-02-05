@@ -60,7 +60,7 @@ async def safe_edit_message(callback: CallbackQuery, text: str, **kwargs):
     try:
         # Проверяем что message доступно и не является InaccessibleMessage
         if callback.message and hasattr(callback.message, 'edit_text'):
-            return await callback.message.edit_text(text, **kwargs)
+            return await callback.message.edit_text(text, **kwargs) # type: ignore
     except TelegramForbiddenError:
         user = callback.from_user
         if user:

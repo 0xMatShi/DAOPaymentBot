@@ -72,7 +72,7 @@ def show_user_detail(user: dict) -> None:
     print(f"  Приватник:   {user['private_key']}")
     print("=" * 50 + "\n")
 
-    inquirer.select(message="", choices=["< Назад"]).execute()
+    inquirer.select(message="", choices=["< Назад"]).execute() # type: ignore
 
 
 def menu_users() -> None:
@@ -80,7 +80,7 @@ def menu_users() -> None:
     users = get_all_users()
     if not users:
         print("Пользователей пока нет.\n")
-        inquirer.select(message="", choices=["< Назад"]).execute()
+        inquirer.select(message="", choices=["< Назад"]).execute() # type: ignore
         return
 
     while True:
@@ -88,7 +88,7 @@ def menu_users() -> None:
         choices = [f"{u['user_id']}" for u in users]
         choices.append("< Назад")
 
-        selected = inquirer.select(
+        selected = inquirer.select( # type: ignore
             message="Выберите пользователя:",
             choices=choices,
         ).execute()
@@ -120,7 +120,7 @@ def menu_export_wallets() -> None:
 def main() -> None:
     clear()
     while True:
-        action = inquirer.select(
+        action = inquirer.select( # type: ignore
             message="Управление ботом:",
             choices=["Users", "Export Wallets", "Exit"],
         ).execute()

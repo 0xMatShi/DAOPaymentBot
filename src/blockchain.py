@@ -514,6 +514,7 @@ async def verify_transaction_by_hash(
     network: str,
     token: str,
     plan: str,
+    user_id: int | None = None,
 ) -> tuple[bool, str, float]:
     """Универсальная функция проверки транзакции по хэшу.
 
@@ -522,6 +523,7 @@ async def verify_transaction_by_hash(
         network: ID сети ('base', 'arbitrum', 'tron', 'solana')
         token: ID токена ('usdc', 'usdt')
         plan: ID плана для проверки суммы
+        user_id: ID пользователя (для кастомных цен из реферальной ссылки)
 
     Returns:
         (is_valid, error_message, amount)
@@ -533,6 +535,7 @@ async def verify_transaction_by_hash(
         get_master_wallet_address,
         check_tx_hash_already_used,
         eth_to_tron_address,
+        get_plan_price_for_user,
     )
 
     # Валидация формата
@@ -552,7 +555,11 @@ async def verify_transaction_by_hash(
     if not plan_info or not token_info or not net_info:
         return False, "Неверные параметры плана/токена/сети", 0.0
 
-    min_amount = plan_info["price"]
+    # Получаем цену с учетом реферальной ссылки пользователя
+    if user_id:
+        min_amount = get_plan_price_for_user(user_id, plan)
+    else:
+        min_amount = plan_info["price"]
     decimals = token_info["decimals"]
     token_address = token_info["addresses"].get(network)
 

@@ -14,7 +14,7 @@ DB_PATH = "data/bot.db"
 PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
 
 SUBSCRIPTION_PLANS = {
-    "1month": {"label": "1 месяц", "price": 50, "duration_days": 30},
+    "1month": {"label": "1 месяц", "price": 0.1, "duration_days": 30},
     "3months": {"label": "3 месяца", "price": 120, "duration_days": 90},
     "forever": {"label": "Навсегда", "price": 250, "duration_days": None},
 }
@@ -177,6 +177,30 @@ def init_db() -> None:
         )
     """)
 
+    # Создать таблицу для реферальных ссылок
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS referral_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            max_uses INTEGER,
+            current_uses INTEGER DEFAULT 0,
+            custom_prices TEXT,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Создать таблицу для отслеживания использования реферальных ссылок
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS referral_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            referral_code TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_profiles (user_id)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -301,6 +325,149 @@ def get_user_profile(user_id: int) -> dict | None:
     if row:
         return dict(row)
     return None
+
+
+def create_referral_link(max_uses: int | None, custom_prices: str | None) -> str:
+    """Создает реферальную ссылку с уникальным кодом."""
+    import secrets
+
+    # Генерируем уникальный код
+    code = secrets.token_urlsafe(8)
+
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO referral_links (code, max_uses, custom_prices) VALUES (?, ?, ?)",
+        (code, max_uses, custom_prices)
+    )
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Created referral link: code={code}, max_uses={max_uses}, custom_prices={custom_prices}")
+    return code
+
+
+def get_referral_link(code: str) -> dict | None:
+    """Получает информацию о реферальной ссылке."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, code, max_uses, current_uses, custom_prices, is_active FROM referral_links WHERE code = ?",
+        (code,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return None
+
+
+def use_referral_link(user_id: int, code: str) -> bool:
+    """Регистрирует использование реферальной ссылки. Возвращает True если успешно."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+
+    # Проверяем, не использовал ли уже пользователь эту ссылку
+    cursor.execute(
+        "SELECT id FROM referral_usage WHERE user_id = ? AND referral_code = ?",
+        (user_id, code)
+    )
+    if cursor.fetchone():
+        conn.close()
+        return False  # Уже использовал
+
+    # Получаем информацию о ссылке
+    cursor.execute(
+        "SELECT max_uses, current_uses, is_active FROM referral_links WHERE code = ?",
+        (code,)
+    )
+    row = cursor.fetchone()
+
+    if not row or not row["is_active"]:
+        conn.close()
+        return False  # Ссылка не найдена или неактивна
+
+    max_uses = row["max_uses"]
+    current_uses = row["current_uses"]
+
+    # Проверяем лимит
+    if max_uses is not None and current_uses >= max_uses:
+        conn.close()
+        return False  # Лимит исчерпан
+
+    # Регистрируем использование
+    cursor.execute(
+        "INSERT INTO referral_usage (user_id, referral_code) VALUES (?, ?)",
+        (user_id, code)
+    )
+
+    # Увеличиваем счетчик
+    cursor.execute(
+        "UPDATE referral_links SET current_uses = current_uses + 1 WHERE code = ?",
+        (code,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Referral link used: user={user_id}, code={code}")
+    return True
+
+
+def get_user_referral_code(user_id: int) -> str | None:
+    """Возвращает реферальный код, по которому пришел пользователь."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT referral_code FROM referral_usage WHERE user_id = ? LIMIT 1",
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return row["referral_code"]
+    return None
+
+
+def get_all_referral_links() -> list[dict]:
+    """Возвращает все реферальные ссылки."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, code, max_uses, current_uses, custom_prices, is_active, created_at "
+        "FROM referral_links ORDER BY created_at DESC"
+    )
+    links = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return links
+
+
+def get_plan_price_for_user(user_id: int, plan_id: str) -> int:
+    """Возвращает цену плана для пользователя с учетом реферальной ссылки."""
+    # Дефолтная цена
+    default_price = SUBSCRIPTION_PLANS.get(plan_id, {}).get("price", 0)
+
+    # Проверяем реферальный код
+    referral_code = get_user_referral_code(user_id)
+    if not referral_code:
+        return default_price
+
+    ref_link = get_referral_link(referral_code)
+    if not ref_link or not ref_link["custom_prices"]:
+        return default_price
+
+    # Парсим кастомные цены
+    try:
+        custom_prices = [int(p.strip()) for p in ref_link["custom_prices"].split(",")]
+        plan_ids = list(SUBSCRIPTION_PLANS.keys())
+        plan_index = plan_ids.index(plan_id)
+
+        if plan_index < len(custom_prices):
+            return custom_prices[plan_index]
+    except (ValueError, IndexError):
+        logger.warning(f"Failed to get custom price for user {user_id}, plan {plan_id}")
+
+    return default_price
 
 
 def update_payment_session_tx_hash(session_id: int, tx_hash: str) -> None:

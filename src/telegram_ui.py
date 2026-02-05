@@ -29,6 +29,9 @@ from src.payments import (
     activate_subscription,
     update_user_profile,
     get_user_profile,
+    get_referral_link,
+    use_referral_link,
+    get_user_referral_code,
 )
 
 router = Router()
@@ -53,11 +56,24 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def plans_kb() -> InlineKeyboardMarkup:
+def plans_kb(custom_prices: list[int] | None = None) -> InlineKeyboardMarkup:
+    """Создает клавиатуру с планами подписок.
+
+    Args:
+        custom_prices: список из 3 цен [price_1month, price_3months, price_forever]
+                      Если None - используются дефолтные цены
+    """
     buttons = []
-    for plan_id, plan in SUBSCRIPTION_PLANS.items():
+    plan_ids = list(SUBSCRIPTION_PLANS.keys())
+
+    for idx, (plan_id, plan) in enumerate(SUBSCRIPTION_PLANS.items()):
+        if custom_prices and idx < len(custom_prices):
+            price = custom_prices[idx]
+        else:
+            price = plan['price']
+
         buttons.append([InlineKeyboardButton(
-            text=f"{plan['label']} - {plan['price']}$",
+            text=f"{plan['label']} - {price}$",
             callback_data=f"plan:{plan_id}",
         )])
     buttons.append([InlineKeyboardButton(text="< Назад", callback_data="back_to_main")])
@@ -104,32 +120,51 @@ def back_kb(callback_data: str = "back_to_main") -> InlineKeyboardMarkup:
 # ── Хендлеры ────────────────────────────────────────────────
 
 
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
+@router.message(CommandStart(deep_link=True))
+async def cmd_start_with_referral(message: Message, state: FSMContext) -> None:
+    """Обработка старта с реферальным кодом."""
     user = message.from_user  # type: ignore
-    logger.info(f"User {user.id} started the bot") # type: ignore
+
+    # Получаем реферальный код из deep link параметра
+    args = message.text.split(maxsplit=1)  # type: ignore
+    referral_code = args[1] if len(args) > 1 else None
+
+    logger.info(f"User {user.id} started the bot with referral code: {referral_code}")
 
     # Сохраняем/обновляем профиль пользователя
-    update_user_profile(user.id, user.username, user.first_name, user.last_name) # type: ignore
+    update_user_profile(user.id, user.username, user.first_name, user.last_name)
+
+    # Пытаемся использовать реферальную ссылку
+    if referral_code:
+        ref_link = get_referral_link(referral_code)
+        if ref_link and ref_link["is_active"]:
+            success = use_referral_link(user.id, referral_code)
+            if success:
+                logger.info(f"User {user.id} successfully used referral code {referral_code}")
+            else:
+                logger.warning(f"User {user.id} failed to use referral code {referral_code}")
 
     # Очищаем FSM при рестарте
     await state.clear()
 
-    cancel_user_payment_sessions(user.id) # type: ignore
+    cancel_user_payment_sessions(user.id)
     await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_kb())
 
 
-@router.message(Command("chatid"))
-async def get_chat_id_command(message: Message) -> None:
-    """Получить ID текущего чата (для настройки канала/группы)"""
-    chat_info = (
-        f"📋 Информация о чате:\n\n"
-        f"ID: <code>{message.chat.id}</code>\n"
-        f"Тип: {message.chat.type}\n"
-        f"Название: {message.chat.title or 'Личные сообщения'}"
-    )
-    logger.info(f"Chat ID request: {message.chat.id}, type: {message.chat.type}, title: {message.chat.title}")
-    await message.answer(chat_info, parse_mode=ParseMode.HTML)
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    """Обработка обычного старта без параметров."""
+    user = message.from_user  # type: ignore
+    logger.info(f"User {user.id} started the bot")
+
+    # Сохраняем/обновляем профиль пользователя
+    update_user_profile(user.id, user.username, user.first_name, user.last_name)
+
+    # Очищаем FSM при рестарте
+    await state.clear()
+
+    cancel_user_payment_sessions(user.id)
+    await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_kb())
 
 
 @router.callback_query(F.data == "back_to_main")
@@ -146,9 +181,23 @@ async def show_plans(callback: CallbackQuery) -> None:
     user = callback.from_user
     update_user_profile(user.id, user.username, user.first_name, user.last_name)
     logger.info(f"User {user.id} opened subscription plans")
+
+    # Проверяем, есть ли у пользователя реферальный код с кастомными ценами
+    custom_prices = None
+    referral_code = get_user_referral_code(user.id)
+    if referral_code:
+        ref_link = get_referral_link(referral_code)
+        if ref_link and ref_link["custom_prices"]:
+            # Парсим кастомные цены из строки "35,90,200"
+            try:
+                custom_prices = [int(p.strip()) for p in ref_link["custom_prices"].split(",")]
+                logger.info(f"Applying custom prices for user {user.id}: {custom_prices}")
+            except ValueError:
+                logger.warning(f"Failed to parse custom prices: {ref_link['custom_prices']}")
+
     await callback.message.edit_text( # type: ignore
         "Выберите одну из предложенных подписок:",
-        reply_markup=plans_kb(),
+        reply_markup=plans_kb(custom_prices),
     )
     await callback.answer()
 
@@ -321,6 +370,7 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
         network=network,
         token=token,
         plan=plan_id,
+        user_id=user_id,
     )
 
     if not is_valid:

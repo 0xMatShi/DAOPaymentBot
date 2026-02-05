@@ -288,12 +288,106 @@ def menu_export_wallets() -> None:
     inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
 
 
+def menu_new_referral() -> None:
+    """Создание новой реферальной ссылки."""
+    import sys
+    sys.path.insert(0, ".")
+    from src.payments import create_referral_link
+
+    clear()
+    print("=" * 80)
+    print("СОЗДАНИЕ РЕФЕРАЛЬНОЙ ССЫЛКИ")
+    print("=" * 80 + "\n")
+
+    # 1. Лимит пользователей
+    max_uses_str = inquirer.text(  # type: ignore
+        message="Лимит использований (оставьте пустым для безлимита):",
+        default=""
+    ).execute()
+
+    max_uses = None
+    if max_uses_str.strip():
+        try:
+            max_uses = int(max_uses_str)
+        except ValueError:
+            print("\n❌ Некорректное число. Отмена.\n")
+            inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+            return
+
+    # 2. Кастомные цены
+    custom_prices_str = inquirer.text(  # type: ignore
+        message="Кастомные цены через запятую (например: 35,90,200) или пустое для дефолтных:",
+        default=""
+    ).execute()
+
+    custom_prices = None
+    if custom_prices_str.strip():
+        try:
+            # Проверяем формат
+            prices = [int(p.strip()) for p in custom_prices_str.split(",")]
+            if len(prices) != 3:
+                print("\n❌ Нужно указать ровно 3 цены (для 1мес, 3мес, навсегда). Отмена.\n")
+                inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+                return
+            custom_prices = custom_prices_str.strip()
+        except ValueError:
+            print("\n❌ Некорректный формат цен. Отмена.\n")
+            inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+            return
+
+    # 3. Подтверждение
+    clear()
+    print("=" * 80)
+    print("ПОДТВЕРЖДЕНИЕ")
+    print("=" * 80)
+    print(f"  Лимит использований: {max_uses if max_uses else 'безлимит'}")
+    print(f"  Кастомные цены:      {custom_prices if custom_prices else 'дефолтные'}")
+    print("=" * 80 + "\n")
+
+    confirm = inquirer.select(  # type: ignore
+        message="Создать ссылку?",
+        choices=["Да", "Нет"]
+    ).execute()
+
+    if confirm != "Да":
+        return
+
+    # 4. Создание и сохранение
+    code = create_referral_link(max_uses, custom_prices)
+
+    # Формируем ссылку (нужно будет вставить username бота вручную)
+    referral_url = f"https://t.me/YOUR_BOT_USERNAME?start={code}"
+
+    # Сохраняем в файл
+    os.makedirs("data", exist_ok=True)
+    filepath = f"data/referral_{code}.txt"
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(f"Реферальная ссылка\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(f"Код: {code}\n")
+        f.write(f"Ссылка: {referral_url}\n\n")
+        f.write(f"Лимит использований: {max_uses if max_uses else 'безлимит'}\n")
+        f.write(f"Кастомные цены: {custom_prices if custom_prices else 'дефолтные'}\n")
+
+    # Показываем результат
+    clear()
+    print("=" * 80)
+    print("✓ РЕФЕРАЛЬНАЯ ССЫЛКА СОЗДАНА")
+    print("=" * 80)
+    print(f"\nКод: {code}")
+    print(f"Ссылка: {referral_url}\n")
+    print(f"Сохранено в: {filepath}\n")
+    print("=" * 80 + "\n")
+
+    inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+
+
 def main() -> None:
     clear()
     while True:
         action = inquirer.select( # type: ignore
             message="Управление ботом:",
-            choices=["Users", "View Master Wallets", "Export Master Wallets", "Exit"],
+            choices=["Users", "View Master Wallets", "Export Master Wallets", "New Referral", "Exit"],
         ).execute()
 
         if action == "Users":
@@ -302,6 +396,8 @@ def main() -> None:
             menu_view_master_wallets()
         elif action == "Export Master Wallets":
             menu_export_wallets()
+        elif action == "New Referral":
+            menu_new_referral()
         elif action == "Exit":
             break
 

@@ -33,6 +33,7 @@ from src.payments import (
     use_referral_link,
     get_user_referral_code,
     get_user_referral_info,
+    get_plan_price_for_user,
 )
 
 router = Router()
@@ -239,9 +240,15 @@ async def show_network_selection(callback: CallbackQuery) -> None:
             await callback.answer("У вас уже приобретён план лучше.", show_alert=True)
             return
 
-    logger.info(f"User {callback.from_user.id} selected plan {plan_id}")
+    user_id = callback.from_user.id
+
+    # Получаем цену с учетом реферальной ссылки
+    price = get_plan_price_for_user(user_id, plan_id)
+    price_str = f"{price:.2f}".rstrip('0').rstrip('.') if isinstance(price, float) else str(price)
+
+    logger.info(f"User {user_id} selected plan {plan_id}, price: {price}")
     await callback.message.edit_text(  # type: ignore
-        f"Оплата подписки: {plan['label']} - {plan['price']}$\n\n"
+        f"Оплата подписки: {plan['label']} - {price_str}$\n\n"
         f"Выберите сеть для перевода:",
         reply_markup=network_kb(plan_id),
     )
@@ -257,10 +264,16 @@ async def show_token_selection(callback: CallbackQuery) -> None:
         await callback.answer("Неизвестный параметр", show_alert=True)
         return
 
-    cancel_user_payment_sessions(callback.from_user.id)
-    logger.info(f"User {callback.from_user.id} selected network {network}")
+    user_id = callback.from_user.id
+    cancel_user_payment_sessions(user_id)
+
+    # Получаем цену с учетом реферальной ссылки
+    price = get_plan_price_for_user(user_id, plan_id)
+    price_str = f"{price:.2f}".rstrip('0').rstrip('.') if isinstance(price, float) else str(price)
+
+    logger.info(f"User {user_id} selected network {network}")
     await callback.message.edit_text(  # type: ignore
-        f"Оплата подписки: {plan['label']} - {plan['price']}$\n"
+        f"Оплата подписки: {plan['label']} - {price_str}$\n"
         f"Сеть: {net['name']}\n\n"
         f"Выберите токен для оплаты:",
         reply_markup=token_kb(plan_id, network),
@@ -297,9 +310,13 @@ async def show_payment(callback: CallbackQuery, state: FSMContext) -> None:
         session_id=session_id,
     )
 
+    # Получаем цену с учетом реферальной ссылки
+    price = get_plan_price_for_user(user_id, plan_id)
+    price_str = f"{price:.2f}".rstrip('0').rstrip('.') if isinstance(price, float) else str(price)
+
     text = (
         f"Оплата подписки: {plan['label']}\n\n"
-        f"Переведите {plan['price']}$ {tok['name']} в сети {net['name']} "
+        f"Переведите {price_str}$ {tok['name']} в сети {net['name']} "
         f"на адрес ниже:\n\n"
         f"<code>{wallet_address}</code>\n\n"
         f"После перевода нажмите \"Подтвердить оплату\" и отправьте хэш транзакции."
@@ -331,19 +348,11 @@ async def confirm_payment_handler(callback: CallbackQuery, state: FSMContext) ->
         token=token,
     )
 
-    # Получаем тип сети для подсказки формата
-    net_type = net.get("type", "")
-    if net_type == "solana":
-        format_hint = "Формат: base58-подпись (обычно 87-88 символов)"
-    else:
-        format_hint = "Формат: 0x + 64 символа (например: 0x1234...abcd)"
-
     text = (
         f"Отправьте хэш транзакции для подтверждения оплаты.\n\n"
         f"План: {plan.get('label', plan_id)}\n"
         f"Сеть: {net.get('name', network)}\n"
         f"Токен: {tok.get('name', token)}\n\n"
-        f"{format_hint}\n\n"
         f"Отмена: /start"
     )
 

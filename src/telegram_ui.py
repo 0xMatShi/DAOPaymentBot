@@ -6,6 +6,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+from aiogram.exceptions import TelegramForbiddenError
 from datetime import datetime, timezone, timedelta
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
@@ -38,6 +39,34 @@ from src.payments import (
 )
 
 router = Router()
+
+
+# ── Вспомогательные функции ─────────────────────────────────────
+
+
+async def safe_send_message(message: Message, text: str, **kwargs):
+    """Безопасная отправка сообщения с обработкой блокировки бота."""
+    try:
+        return await message.answer(text, **kwargs)
+    except TelegramForbiddenError:
+        user = message.from_user
+        if user:
+            logger.warning(f"User {user.id} has blocked the bot")
+        return None
+
+
+async def safe_edit_message(callback: CallbackQuery, text: str, **kwargs):
+    """Безопасное редактирование сообщения с обработкой блокировки бота."""
+    try:
+        # Проверяем что message доступно и не является InaccessibleMessage
+        if callback.message and hasattr(callback.message, 'edit_text'):
+            return await callback.message.edit_text(text, **kwargs)
+    except TelegramForbiddenError:
+        user = callback.from_user
+        if user:
+            logger.warning(f"User {user.id} has blocked the bot")
+        return None
+
 
 MAIN_MENU_TEXT = (
     "Приветствую, боец. Ты уже участник DAO, осталась маленькая формальность в виде оплаты\n\n"
@@ -164,7 +193,7 @@ async def cmd_start_with_referral(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     cancel_user_payment_sessions(user.id) # type: ignore
-    await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_kb())
+    await safe_send_message(message, MAIN_MENU_TEXT, reply_markup=main_menu_kb())
 
 
 @router.message(CommandStart())
@@ -180,7 +209,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     cancel_user_payment_sessions(user.id) # type: ignore
-    await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_kb())
+    await safe_send_message(message, MAIN_MENU_TEXT, reply_markup=main_menu_kb())
 
 
 @router.callback_query(F.data == "back_to_main")
@@ -188,7 +217,7 @@ async def back_to_main(callback: CallbackQuery) -> None:
     user = callback.from_user
     update_user_profile(user.id, user.username, user.first_name, user.last_name)
     cancel_user_payment_sessions(user.id)
-    await callback.message.edit_text(MAIN_MENU_TEXT, reply_markup=main_menu_kb()) # type: ignore
+    await safe_edit_message(callback, MAIN_MENU_TEXT, reply_markup=main_menu_kb())
     await callback.answer()
 
 
@@ -219,7 +248,8 @@ async def show_plans(callback: CallbackQuery) -> None:
     else:
         logger.info(f"No referral code for user {user.id}")
 
-    await callback.message.edit_text( # type: ignore
+    await safe_edit_message(
+        callback,
         "Выберите одну из предложенных подписок:",
         reply_markup=plans_kb(custom_prices),
     )
@@ -254,7 +284,8 @@ async def show_token_selection(callback: CallbackQuery) -> None:
     price_str = f"{price:.2f}".rstrip('0').rstrip('.') if isinstance(price, float) else str(price)
 
     logger.info(f"User {user_id} selected plan {plan_id}, price: {price}")
-    await callback.message.edit_text(  # type: ignore
+    await safe_edit_message(
+        callback,
         f"Оплата подписки: {plan['label']} - {price_str}$\n\n"
         f"Выберите монету для оплаты:",
         reply_markup=token_kb(plan_id),
@@ -280,7 +311,8 @@ async def show_network_selection(callback: CallbackQuery) -> None:
     price_str = f"{price:.2f}".rstrip('0').rstrip('.') if isinstance(price, float) else str(price)
 
     logger.info(f"User {user_id} selected token {token}")
-    await callback.message.edit_text(  # type: ignore
+    await safe_edit_message(
+        callback,
         f"Оплата подписки: {plan['label']} - {price_str}$\n"
         f"Монета: {tok['name']}\n\n"
         f"Выберите сеть для перевода:",
@@ -337,7 +369,8 @@ async def show_payment(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     logger.info(f"User {user_id} selected {tok['name']} on {net['name']}, master wallet: {wallet_address}")
-    await callback.message.edit_text(  # type: ignore
+    await safe_edit_message(
+        callback,
         text,
         reply_markup=payment_kb(plan_id, token, network),
         parse_mode=ParseMode.HTML,
@@ -371,11 +404,10 @@ async def confirm_payment_handler(callback: CallbackQuery, state: FSMContext) ->
         f"Отправьте хэш транзакции для подтверждения оплаты.\n\n"
         f"План: {plan.get('label', plan_id)}\n"
         f"Монета: {tok.get('name', token)}\n"
-        f"Сеть: {net.get('name', network)}\n\n"
-        f"Отмена: /start"
+        f"Сеть: {net.get('name', network)}"
     )
 
-    await callback.message.edit_text(text, reply_markup=None)  # type: ignore
+    await safe_edit_message(callback, text, reply_markup=None)
     await state.set_state(PaymentStates.waiting_for_tx_hash)
     await callback.answer()
     logger.info(f"User {user_id} entered tx hash input mode for {plan_id}/{token}/{network}")
@@ -397,8 +429,9 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
     session_id = data.get("session_id")
 
     if not plan_id or not network or not token:
-        await message.answer(
-            "Ошибка: данные сессии потеряны. Начните заново: /start",
+        await safe_send_message(
+            message,
+            "Ошибка: данные сессии потеряны. Начните заново.",
             reply_markup=back_kb(),
         )
         await state.clear()
@@ -420,9 +453,10 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
 
     if not is_valid:
         # Ошибка - даём возможность повторить
-        await message.answer(
+        await safe_send_message(
+            message,
             f"❌ Ошибка проверки транзакции:\n{error_msg}\n\n"
-            f"Попробуйте ещё раз или отмените: /start"
+            f"Попробуйте ещё раз."
         )
         logger.warning(f"Transaction verification failed for user {user_id}: {error_msg}")
         return
@@ -474,9 +508,9 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
         f"{link_text}"
     )
 
-    await message.answer(
+    await safe_send_message(
+        message,
         success_text,
-        reply_markup=back_kb(),
         parse_mode=ParseMode.HTML,
     )
 
@@ -552,7 +586,7 @@ async def show_profile(callback: CallbackQuery) -> None:
     )
 
     logger.info(f"User {user_id} opened profile")
-    await callback.message.edit_text(text, reply_markup=back_kb(), parse_mode=ParseMode.HTML) # type: ignore
+    await safe_edit_message(callback, text, reply_markup=back_kb(), parse_mode=ParseMode.HTML)
     await callback.answer()
 
 

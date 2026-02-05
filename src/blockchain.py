@@ -305,12 +305,22 @@ def validate_tx_hash_format(network: str, tx_hash: str) -> tuple[bool, str]:
 
     net_type = net_info.get("type")
 
-    if net_type in ["evm", "tron"]:
-        # EVM и Tron: 0x + 64 hex chars (32 bytes)
+    if net_type == "evm":
+        # EVM: 0x + 64 hex chars (32 bytes)
         if not tx_hash.startswith("0x"):
             return False, "Хэш должен начинаться с '0x'"
         if len(tx_hash) != 66:  # 0x + 64 chars
             return False, f"Неверная длина хэша (ожидается 66 символов, получено {len(tx_hash)})"
+        try:
+            int(tx_hash, 16)  # Проверка hex
+        except ValueError:
+            return False, "Хэш содержит недопустимые символы (только 0-9, a-f)"
+        return True, ""
+
+    elif net_type == "tron":
+        # Tron: 64 hex chars (32 bytes), без префикса 0x
+        if len(tx_hash) != 64:
+            return False, f"Неверная длина хэша (ожидается 64 символа, получено {len(tx_hash)})"
         try:
             int(tx_hash, 16)  # Проверка hex
         except ValueError:

@@ -11,10 +11,11 @@ from solders.keypair import Keypair
 from src.logger import logger
 
 DB_PATH = "data/bot.db"
-PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
+PRIVATE_CHAT_ID = int(os.getenv("PRIVATE_CHAT_ID", "0"))
+PRIVATE_GROUP_ID = int(os.getenv("PRIVATE_GROUP_ID", "0"))  # Используем имя переменной с опечаткой из .env
 
 SUBSCRIPTION_PLANS = {
-    "1month": {"label": "1 месяц", "price": 50, "duration_days": 30},
+    "1month": {"label": "1 месяц", "price": 0.1, "duration_days": 30},
     "3months": {"label": "3 месяца", "price": 120, "duration_days": 90},
     "forever": {"label": "Навсегда", "price": 250, "duration_days": None},
 }
@@ -865,8 +866,40 @@ def activate_subscription(user_id: int, plan: str) -> None:
                 logger.info(f"Referral link owner {owner_id} has no active subscription, skipping reward")
 
 
-async def create_invite_link(bot: Bot, user_id: int, plan_name: str) -> str:
-    """Создать одноразовую ссылку-приглашение в приватный канал.
+async def create_invite_link_for_chat(bot: Bot, chat_id: int, user_id: int, plan_name: str, chat_type: str) -> str:
+    """Создать одноразовую ссылку-приглашение для конкретного чата.
+
+    Args:
+        bot: Экземпляр Bot для API-вызовов
+        chat_id: ID чата/группы
+        user_id: ID пользователя Telegram
+        plan_name: Название плана подписки
+        chat_type: Тип чата для логирования ("chat" или "group")
+
+    Returns:
+        URL одноразовой пригласительной ссылки
+    """
+    logger.info(f"Attempting to create invite link for {chat_type}: chat_id={chat_id}, user={user_id}, plan={plan_name}")
+
+    if chat_id == 0:
+        logger.error(f"{chat_type.upper()}_ID not set in environment variables!")
+        raise ValueError(f"{chat_type} ID not configured")
+
+    try:
+        invite_link = await bot.create_chat_invite_link(
+            chat_id=chat_id,
+            member_limit=1,  # Одноразовая ссылка
+            name=f"{plan_name} - User {user_id}"  # Для удобства в логах канала
+        )
+        logger.info(f"Created invite link for {chat_type} for user {user_id}, plan {plan_name}")
+        return invite_link.invite_link
+    except Exception as e:
+        logger.error(f"Failed to create invite link for {chat_type} for user {user_id}: {e}")
+        raise
+
+
+async def create_invite_links(bot: Bot, user_id: int, plan_name: str) -> dict[str, str]:
+    """Создать одноразовые ссылки-приглашения для чата и группы.
 
     Args:
         bot: Экземпляр Bot для API-вызовов
@@ -874,22 +907,22 @@ async def create_invite_link(bot: Bot, user_id: int, plan_name: str) -> str:
         plan_name: Название плана подписки
 
     Returns:
-        URL одноразовой пригласительной ссылки
+        Словарь с ключами "chat" и "group", содержащий пригласительные ссылки
     """
-    logger.info(f"Attempting to create invite link: chat_id={PRIVATE_CHANNEL_ID} (type: {type(PRIVATE_CHANNEL_ID)}), user={user_id}, plan={plan_name}")
+    links = {}
 
-    if PRIVATE_CHANNEL_ID == 0:
-        logger.error("PRIVATE_CHANNEL_ID not set in environment variables!")
-        raise ValueError("PRIVATE_CHANNEL_ID not configured")
-
+    # Создаём ссылку для чата
     try:
-        invite_link = await bot.create_chat_invite_link(
-            chat_id=PRIVATE_CHANNEL_ID,
-            member_limit=1,  # Одноразовая ссылка
-            name=f"{plan_name} - User {user_id}"  # Для удобства в логах канала
-        )
-        logger.info(f"Created invite link for user {user_id}, plan {plan_name}")
-        return invite_link.invite_link
+        links["chat"] = await create_invite_link_for_chat(bot, PRIVATE_CHAT_ID, user_id, plan_name, "chat")
     except Exception as e:
-        logger.error(f"Failed to create invite link for user {user_id}: {e}")
-        raise
+        logger.error(f"Failed to create chat invite link: {e}")
+        links["chat"] = None
+
+    # Создаём ссылку для группы
+    try:
+        links["group"] = await create_invite_link_for_chat(bot, PRIVATE_GROUP_ID, user_id, plan_name, "group")
+    except Exception as e:
+        logger.error(f"Failed to create group invite link: {e}")
+        links["group"] = None
+
+    return links

@@ -19,7 +19,7 @@ from src.payments import (
     SUPPORTED_NETWORKS,
     SUPPORTED_TOKENS,
     cancel_user_payment_sessions,
-    create_invite_link,
+    create_invite_links,
     create_payment_session,
     get_user_subscription,
     get_master_wallet_address,
@@ -425,13 +425,27 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
         update_payment_session_tx_hash(session_id, tx_hash)
         complete_payment_session(session_id)
 
-    # Генерируем пригласительную ссылку
+    # Генерируем пригласительные ссылки для чата и группы
     try:
-        invite_link = await create_invite_link(bot, user_id, plan.get('label', plan_id))
-        link_text = f"\n\nВаша одноразовая ссылка для вступления в канал:\n{invite_link}\n\n⚠️ Ссылка станет недействительной после присоединения одного человека!"
+        invite_links = await create_invite_links(bot, user_id, plan.get('label', plan_id))
+
+        link_text = "\n\n📱 Ваши одноразовые ссылки для вступления:"
+
+        if invite_links.get("chat"):
+            link_text += f"\n\n🔹 Чат:\n{invite_links['chat']}"
+        else:
+            link_text += f"\n\n🔹 Чат:\n⚠️ Не удалось создать ссылку"
+
+        if invite_links.get("group"):
+            link_text += f"\n\n🔹 Группа:\n{invite_links['group']}"
+        else:
+            link_text += f"\n\n🔹 Группа:\n⚠️ Не удалось создать ссылку"
+
+        link_text += "\n\n⚠️ Каждая ссылка станет недействительной после присоединения одного человека!"
+
     except Exception as e:
-        logger.error(f"Failed to create invite link for user {user_id}: {e}")
-        link_text = "\n\n⚠️ Не удалось создать пригласительную ссылку. Обратитесь в поддержку."
+        logger.error(f"Failed to create invite links for user {user_id}: {e}")
+        link_text = "\n\n⚠️ Не удалось создать пригласительные ссылки. Обратитесь в поддержку."
 
     success_text = (
         f"✅ Оплата подтверждена!\n\n"

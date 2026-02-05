@@ -32,6 +32,7 @@ from src.payments import (
     get_referral_link,
     use_referral_link,
     get_user_referral_code,
+    get_user_referral_info,
 )
 
 router = Router()
@@ -446,6 +447,13 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
                 elif profile.get("first_name"):
                     user_display += f" | {profile['first_name']}"
 
+            # Получаем реферальную информацию
+            ref_info = get_user_referral_info(user_id)
+            ref_text = ""
+            if ref_info:
+                ref_name = ref_info.get('name') or "без названия"
+                ref_text = f"\nРеф. ссылка: {ref_name} ({ref_info['code']})"
+
             await bot.send_message(
                 int(admin_chat_id),
                 f"💰 Новая оплата:\n"
@@ -454,6 +462,7 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
                 f"Сумма: {amount} {tok.get('name', token)}\n"
                 f"Сеть: {net.get('name', network)}\n"
                 f"Tx: {tx_hash}"
+                f"{ref_text}"
             )
         except Exception as e:
             logger.error(f"Failed to send admin notification: {e}")

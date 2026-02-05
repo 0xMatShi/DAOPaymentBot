@@ -165,9 +165,14 @@ def cancel_subscription(user_id: int) -> None:
 
 
 def show_user_detail(user: dict) -> None:
+    import sys
+    sys.path.insert(0, ".")
+    from src.payments import get_user_referral_info
+
     while True:
         clear()
         sub = get_user_subscription(user["user_id"])
+        ref_info = get_user_referral_info(user["user_id"])
 
         print("=" * 50)
         print(f"  ID:          {user['user_id']}")
@@ -183,6 +188,17 @@ def show_user_detail(user: dict) -> None:
             print(f"  Истекает:    {format_expires(sub['expires_at'])}")
         else:
             print("  Подписка:    нет")
+
+        # Показываем реферальную информацию
+        if ref_info:
+            print(f"  Реф. код:    {ref_info['code']}")
+            if ref_info['name']:
+                print(f"  Реф. ссылка: {ref_info['name']}")
+            else:
+                print(f"  Реф. ссылка: без названия")
+        else:
+            print("  Реф. ссылка: нет")
+
         print("=" * 50 + "\n")
 
         action = inquirer.select(  # type: ignore
@@ -335,11 +351,20 @@ def menu_new_referral() -> None:
             inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
             return
 
-    # 3. Подтверждение
+    # 3. Название ссылки
+    name = inquirer.text(  # type: ignore
+        message="Название ссылки (для идентификации, например 'VK реклама'):",
+        default=""
+    ).execute()
+
+    name = name.strip() if name.strip() else None
+
+    # 4. Подтверждение
     clear()
     print("=" * 80)
     print("ПОДТВЕРЖДЕНИЕ")
     print("=" * 80)
+    print(f"  Название:            {name if name else 'без названия'}")
     print(f"  Лимит использований: {max_uses if max_uses else 'безлимит'}")
     print(f"  Кастомные цены:      {custom_prices if custom_prices else 'дефолтные'}")
     print("=" * 80 + "\n")
@@ -352,10 +377,10 @@ def menu_new_referral() -> None:
     if confirm != "Да":
         return
 
-    # 4. Создание и сохранение
-    code = create_referral_link(max_uses, custom_prices)
+    # 5. Создание и сохранение
+    code = create_referral_link(max_uses, custom_prices, name)
 
-    # Формируем ссылку (нужно будет вставить username бота вручную)
+    # Формируем ссылку
     referral_url = f"https://t.me/ANdexDAOPaymentBot?start={code}"
 
     # Сохраняем в файл
@@ -364,6 +389,8 @@ def menu_new_referral() -> None:
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(f"Реферальная ссылка\n")
         f.write("=" * 80 + "\n\n")
+        if name:
+            f.write(f"Название: {name}\n")
         f.write(f"Код: {code}\n")
         f.write(f"Ссылка: {referral_url}\n\n")
         f.write(f"Лимит использований: {max_uses if max_uses else 'безлимит'}\n")
@@ -372,14 +399,16 @@ def menu_new_referral() -> None:
     # Показываем результат
     clear()
     print("=" * 80)
-    print("✓ РЕФЕРАЛЬНАЯ ССЫЛКА СОЗДАНА")
+    print("OK REFERALNAYA SSYLKA SOZDANA")
     print("=" * 80)
-    print(f"\nКод: {code}")
-    print(f"Ссылка: {referral_url}\n")
-    print(f"Сохранено в: {filepath}\n")
+    if name:
+        print(f"\nNazvanie: {name}")
+    print(f"Kod: {code}")
+    print(f"Ssylka: {referral_url}\n")
+    print(f"Sohraneno v: {filepath}\n")
     print("=" * 80 + "\n")
 
-    inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+    inquirer.select(message="", choices=["< Nazad"]).execute()  # type: ignore
 
 
 def main() -> None:

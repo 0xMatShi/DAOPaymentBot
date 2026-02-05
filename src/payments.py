@@ -201,6 +201,11 @@ def init_db() -> None:
         )
     """)
 
+    # Миграция: добавить колонку name в referral_links
+    existing_ref = {row[1] for row in cursor.execute("PRAGMA table_info(referral_links)").fetchall()}
+    if "name" not in existing_ref:
+        cursor.execute("ALTER TABLE referral_links ADD COLUMN name TEXT")
+
     conn.commit()
     conn.close()
 
@@ -327,8 +332,17 @@ def get_user_profile(user_id: int) -> dict | None:
     return None
 
 
-def create_referral_link(max_uses: int | None, custom_prices: str | None) -> str:
-    """Создает реферальную ссылку с уникальным кодом."""
+def create_referral_link(max_uses: int | None, custom_prices: str | None, name: str | None = None) -> str:
+    """Создает реферальную ссылку с уникальным кодом.
+
+    Args:
+        max_uses: Лимит использований (None = безлимит)
+        custom_prices: Кастомные цены ("35,90,200" или None)
+        name: Название ссылки для идентификации
+
+    Returns:
+        Уникальный код ссылки
+    """
     import secrets
 
     # Генерируем уникальный код
@@ -337,13 +351,13 @@ def create_referral_link(max_uses: int | None, custom_prices: str | None) -> str
     conn = _get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO referral_links (code, max_uses, custom_prices) VALUES (?, ?, ?)",
-        (code, max_uses, custom_prices)
+        "INSERT INTO referral_links (code, max_uses, custom_prices, name) VALUES (?, ?, ?, ?)",
+        (code, max_uses, custom_prices, name)
     )
     conn.commit()
     conn.close()
 
-    logger.info(f"Created referral link: code={code}, max_uses={max_uses}, custom_prices={custom_prices}")
+    logger.info(f"Created referral link: code={code}, name={name}, max_uses={max_uses}, custom_prices={custom_prices}")
     return code
 
 
@@ -352,7 +366,7 @@ def get_referral_link(code: str) -> dict | None:
     conn = _get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, code, max_uses, current_uses, custom_prices, is_active FROM referral_links WHERE code = ?",
+        "SELECT id, code, max_uses, current_uses, custom_prices, is_active, name FROM referral_links WHERE code = ?",
         (code,)
     )
     row = cursor.fetchone()
@@ -437,12 +451,34 @@ def get_user_referral_code(user_id: int) -> str | None:
     return None
 
 
+def get_user_referral_info(user_id: int) -> dict | None:
+    """Возвращает полную информацию о реферальной ссылке пользователя (код + название).
+
+    Returns:
+        {"code": str, "name": str} или None если пользователь не по реферальной ссылке
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT ru.referral_code, rl.name "
+        "FROM referral_usage ru "
+        "JOIN referral_links rl ON ru.referral_code = rl.code "
+        "WHERE ru.user_id = ? LIMIT 1",
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"code": row["referral_code"], "name": row["name"]}
+    return None
+
+
 def get_all_referral_links() -> list[dict]:
     """Возвращает все реферальные ссылки."""
     conn = _get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, code, max_uses, current_uses, custom_prices, is_active, created_at "
+        "SELECT id, code, max_uses, current_uses, custom_prices, is_active, name, created_at "
         "FROM referral_links ORDER BY created_at DESC"
     )
     links = [dict(row) for row in cursor.fetchall()]

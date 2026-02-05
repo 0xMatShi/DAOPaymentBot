@@ -14,7 +14,7 @@ DB_PATH = "data/bot.db"
 PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
 
 SUBSCRIPTION_PLANS = {
-    "1month": {"label": "1 месяц", "price": 0.1, "duration_days": 30},
+    "1month": {"label": "1 месяц", "price": 50, "duration_days": 30},
     "3months": {"label": "3 месяца", "price": 120, "duration_days": 90},
     "forever": {"label": "Навсегда", "price": 250, "duration_days": None},
 }

@@ -16,9 +16,10 @@ from src.payments import (
     SUBSCRIPTION_PLANS,
     SUPPORTED_NETWORKS,
     SUPPORTED_TOKENS,
+    cancel_user_payment_sessions,
     check_payment,
     create_payment_session,
-    get_or_create_wallet,
+    get_wallet_for_network,
     get_user_subscription,
 )
 
@@ -69,6 +70,8 @@ def network_kb(plan_id: str) -> InlineKeyboardMarkup:
 def token_kb(plan_id: str, network: str) -> InlineKeyboardMarkup:
     buttons = []
     for token_id, token in SUPPORTED_TOKENS.items():
+        if network not in token["addresses"]:
+            continue
         buttons.append([InlineKeyboardButton(
             text=token["name"],
             callback_data=f"token:{plan_id}:{network}:{token_id}",
@@ -96,11 +99,13 @@ def back_kb(callback_data: str = "back_to_main") -> InlineKeyboardMarkup:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     logger.info(f"User {message.from_user.id} started the bot") # type: ignore
+    cancel_user_payment_sessions(message.from_user.id)  # type: ignore
     await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_kb())
 
 
 @router.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery) -> None:
+    cancel_user_payment_sessions(callback.from_user.id)
     await callback.message.edit_text(MAIN_MENU_TEXT, reply_markup=main_menu_kb()) # type: ignore
     await callback.answer()
 
@@ -123,6 +128,18 @@ async def show_network_selection(callback: CallbackQuery) -> None:
         await callback.answer("Неизвестный план", show_alert=True)
         return
 
+    PLAN_RANK = {"1month": 1, "3months": 2, "forever": 3}
+    sub = get_user_subscription(callback.from_user.id)
+    if sub:
+        current_rank = PLAN_RANK.get(sub["plan"], 0)
+        selected_rank = PLAN_RANK.get(plan_id, 0)
+        if selected_rank == current_rank:
+            await callback.answer("Этот тип подписки уже активирован.", show_alert=True)
+            return
+        if selected_rank < current_rank:
+            await callback.answer("У вас уже приобретён план лучше.", show_alert=True)
+            return
+
     logger.info(f"User {callback.from_user.id} selected plan {plan_id}")
     await callback.message.edit_text(  # type: ignore
         f"Оплата подписки: {plan['label']} - {plan['price']}$\n\n"
@@ -141,6 +158,7 @@ async def show_token_selection(callback: CallbackQuery) -> None:
         await callback.answer("Неизвестный параметр", show_alert=True)
         return
 
+    cancel_user_payment_sessions(callback.from_user.id)
     logger.info(f"User {callback.from_user.id} selected network {network}")
     await callback.message.edit_text(  # type: ignore
         f"Оплата подписки: {plan['label']} - {plan['price']}$\n"
@@ -162,7 +180,7 @@ async def show_payment(callback: CallbackQuery) -> None:
         return
 
     user_id = callback.from_user.id
-    wallet_address = get_or_create_wallet(user_id)
+    wallet_address = get_wallet_for_network(user_id, network)
 
     # Фиксируем текущий блок для сканирования платежей
     try:

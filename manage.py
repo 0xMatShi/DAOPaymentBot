@@ -21,7 +21,10 @@ def get_connection() -> sqlite3.Connection:
 def get_all_users() -> list[dict]:
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, wallet_address, private_key FROM users ORDER BY user_id")
+    cursor.execute(
+        "SELECT user_id, wallet_address, private_key, "
+        "sol_wallet_address, sol_private_key FROM users ORDER BY user_id"
+    )
     users = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return users
@@ -57,22 +60,123 @@ PLAN_LABELS = {
 }
 
 
-def show_user_detail(user: dict) -> None:
-    clear()
-    sub = get_user_subscription(user["user_id"])
+def change_plan(user_id: int) -> None:
+    plan_choices = [f"{pid} ({label})" for pid, label in PLAN_LABELS.items()]
+    plan_choices.append("< Отмена")
 
-    print("=" * 50)
-    print(f"  ID:          {user['user_id']}")
-    if sub:
-        print(f"  Подписка:    {PLAN_LABELS.get(sub['plan'], sub['plan'])}")
-        print(f"  Истекает:    {format_expires(sub['expires_at'])}")
+    selected = inquirer.select(  # type: ignore
+        message="Выберите новый план:",
+        choices=plan_choices,
+    ).execute()
+
+    if selected == "< Отмена":
+        return
+
+    new_plan = selected.split(" (")[0]
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    if new_plan == "forever":
+        expires_at = None
     else:
-        print("  Подписка:    нет")
-    print(f"  Кошелёк:     {user['wallet_address']}")
-    print(f"  Приватник:   {user['private_key']}")
-    print("=" * 50 + "\n")
+        days = {"1month": 30, "3months": 90}[new_plan]
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
-    inquirer.select(message="", choices=["< Назад"]).execute() # type: ignore
+    cursor.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
+    cursor.execute(
+        "INSERT INTO subscriptions (user_id, plan, status, expires_at) VALUES (?, ?, 'active', ?)",
+        (user_id, new_plan, expires_at),
+    )
+
+    conn.commit()
+    conn.close()
+    print(f"\nПлан изменён на {PLAN_LABELS[new_plan]}.\n")
+
+
+def add_days(user_id: int) -> None:
+    sub = get_user_subscription(user_id)
+    if not sub:
+        print("\nУ пользователя нет активной подписки.\n")
+        return
+    if not sub["expires_at"]:
+        print("\nПодписка бессрочная, добавление дней не требуется.\n")
+        return
+
+    days_str = inquirer.text(message="Количество дней:").execute()  # type: ignore
+    try:
+        days = int(days_str)
+    except ValueError:
+        print("\nНекорректное число.\n")
+        return
+
+    current_expires = datetime.fromisoformat(sub["expires_at"])
+    new_expires = current_expires + timedelta(days=days)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE subscriptions SET expires_at = ? WHERE user_id = ? AND status = 'active'",
+        (new_expires.isoformat(), user_id),
+    )
+    conn.commit()
+    conn.close()
+    print(f"\nДобавлено {days} дн. Новый срок: {format_expires(new_expires.isoformat())}\n")
+
+
+def cancel_subscription(user_id: int) -> None:
+    sub = get_user_subscription(user_id)
+    if not sub:
+        print("\nУ пользователя нет активной подписки.\n")
+        return
+
+    confirm = inquirer.select(  # type: ignore
+        message=f"Отменить подписку \"{PLAN_LABELS.get(sub['plan'], sub['plan'])}\"?",
+        choices=["Да", "Нет"],
+    ).execute()
+
+    if confirm != "Да":
+        return
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    print("\nПодписка отменена.\n")
+
+
+def show_user_detail(user: dict) -> None:
+    while True:
+        clear()
+        sub = get_user_subscription(user["user_id"])
+
+        print("=" * 50)
+        print(f"  ID:          {user['user_id']}")
+        if sub:
+            print(f"  Подписка:    {PLAN_LABELS.get(sub['plan'], sub['plan'])}")
+            print(f"  Истекает:    {format_expires(sub['expires_at'])}")
+        else:
+            print("  Подписка:    нет")
+        print(f"  EVM адрес:   {user['wallet_address']}")
+        print(f"  EVM ключ:    {user['private_key']}")
+        print(f"  SOL адрес:   {user.get('sol_wallet_address') or 'не создан'}")
+        print(f"  SOL ключ:    {user.get('sol_private_key') or 'не создан'}")
+        print("=" * 50 + "\n")
+
+        action = inquirer.select(  # type: ignore
+            message="Действие:",
+            choices=["Изменить план", "Добавить дни", "Отменить подписку", "< Назад"],
+        ).execute()
+
+        if action == "< Назад":
+            return
+        elif action == "Изменить план":
+            change_plan(user["user_id"])
+        elif action == "Добавить дни":
+            add_days(user["user_id"])
+        elif action == "Отменить подписку":
+            cancel_subscription(user["user_id"])
 
 
 def menu_users() -> None:
@@ -112,7 +216,10 @@ def menu_export_wallets() -> None:
 
     with open(filepath, "w", encoding="utf-8") as f:
         for i, u in enumerate(users, 1):
-            f.write(f"{i}. {u['user_id']} | {u['private_key']}\n")
+            erc_key = u["private_key"]
+            trc_key = erc_key  # Tron использует тот же secp256k1 ключ
+            sol_key = u.get("sol_private_key") or "N/A"
+            f.write(f"{i}. {u['user_id']} | {erc_key} | {trc_key} | {sol_key}\n")
 
     print(f"\nЭкспортировано {len(users)} кошельков в {filepath}\n")
 

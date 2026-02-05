@@ -1,8 +1,11 @@
+import hashlib
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+import base58
 from eth_account import Account
+from solders.keypair import Keypair
 
 from src.logger import logger
 
@@ -10,22 +13,36 @@ DB_PATH = "data/bot.db"
 
 SUBSCRIPTION_PLANS = {
     "1month": {"label": "1 месяц", "price": 1, "duration_days": 30},
-    "3months": {"label": "3 месяца", "price": 2, "duration_days": 90},
-    "forever": {"label": "Навсегда", "price": 3, "duration_days": None},
+    "3months": {"label": "3 месяца", "price": 120, "duration_days": 90},
+    "forever": {"label": "Навсегда", "price": 250, "duration_days": None},
 }
 
 SUPPORTED_NETWORKS = {
     "base": {
         "name": "Base",
+        "type": "evm",
         "chain_id": 8453,
         "rpc_url_env": "BASE_RPC_URL",
         "rpc_url_default": "https://mainnet.base.org",
     },
     "arbitrum": {
         "name": "Arbitrum One",
+        "type": "evm",
         "chain_id": 42161,
         "rpc_url_env": "ARBITRUM_RPC_URL",
         "rpc_url_default": "https://arb1.arbitrum.io/rpc",
+    },
+    "tron": {
+        "name": "Tron (TRC-20)",
+        "type": "tron",
+        "api_url_env": "TRONGRID_API_URL",
+        "api_url_default": "https://api.trongrid.io",
+    },
+    "solana": {
+        "name": "Solana",
+        "type": "solana",
+        "rpc_url_env": "SOLANA_RPC_URL",
+        "rpc_url_default": "https://api.mainnet-beta.solana.com",
     },
 }
 
@@ -36,6 +53,7 @@ SUPPORTED_TOKENS = {
         "addresses": {
             "base": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
             "arbitrum": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+            "solana": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
         },
     },
     "usdt": {
@@ -44,9 +62,40 @@ SUPPORTED_TOKENS = {
         "addresses": {
             "base": "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",
             "arbitrum": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+            "tron": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+            "solana": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
         },
     },
 }
+
+
+def eth_to_tron_address(eth_address: str) -> str:
+    """Конвертирует Ethereum-адрес в Tron-адрес (base58check с префиксом 0x41)."""
+    addr_bytes = bytes.fromhex(eth_address[2:])
+    prefixed = b'\x41' + addr_bytes
+    h1 = hashlib.sha256(prefixed).digest()
+    h2 = hashlib.sha256(h1).digest()
+    return base58.b58encode(prefixed + h2[:4]).decode()
+
+
+def get_wallet_for_network(user_id: int, network: str) -> str:
+    """Возвращает адрес кошелька в формате нужной сети."""
+    _ensure_all_wallets(user_id)
+    net = SUPPORTED_NETWORKS.get(network, {})
+    net_type = net.get("type", "evm")
+
+    if net_type == "solana":
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT sol_wallet_address FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row["sol_wallet_address"]
+
+    eth_address = get_or_create_wallet(user_id)
+    if net_type == "tron":
+        return eth_to_tron_address(eth_address)
+    return eth_address
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -110,12 +159,20 @@ def init_db() -> None:
         )
     """)
 
+    # Миграция: добавляем колонки для Solana-кошелька
+    existing = {row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()}
+    if "sol_wallet_address" not in existing:
+        cursor.execute("ALTER TABLE users ADD COLUMN sol_wallet_address TEXT")
+    if "sol_private_key" not in existing:
+        cursor.execute("ALTER TABLE users ADD COLUMN sol_private_key TEXT")
+
     conn.commit()
     conn.close()
     logger.info("Database initialized")
 
 
 def get_or_create_wallet(user_id: int) -> str:
+    """Возвращает EVM-адрес, создавая все кошельки при необходимости."""
     conn = _get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT wallet_address FROM users WHERE user_id = ?", (user_id,))
@@ -126,17 +183,42 @@ def get_or_create_wallet(user_id: int) -> str:
         return row["wallet_address"]
 
     account = Account.create()
-    wallet_address = account.address
-    private_key = account.key.hex()
+    sol_kp = Keypair()
 
     cursor.execute(
-        "INSERT INTO users (user_id, wallet_address, private_key) VALUES (?, ?, ?)",
-        (user_id, wallet_address, private_key),
+        "INSERT INTO users (user_id, wallet_address, private_key, sol_wallet_address, sol_private_key) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user_id, account.address, account.key.hex(),
+         str(sol_kp.pubkey()), base58.b58encode(bytes(sol_kp)).decode()),
     )
     conn.commit()
     conn.close()
-    logger.info(f"Created wallet {wallet_address} for user {user_id}")
-    return wallet_address
+    logger.info(f"Created wallets for user {user_id}: EVM={account.address}, SOL={sol_kp.pubkey()}")
+    return account.address
+
+
+def _ensure_all_wallets(user_id: int) -> None:
+    """Догенерирует недостающие кошельки для существующего пользователя."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT sol_wallet_address FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        conn.close()
+        get_or_create_wallet(user_id)
+        return
+
+    if not row["sol_wallet_address"]:
+        sol_kp = Keypair()
+        cursor.execute(
+            "UPDATE users SET sol_wallet_address = ?, sol_private_key = ? WHERE user_id = ?",
+            (str(sol_kp.pubkey()), base58.b58encode(bytes(sol_kp)).decode(), user_id),
+        )
+        conn.commit()
+        logger.info(f"Generated Solana wallet for existing user {user_id}: {sol_kp.pubkey()}")
+
+    conn.close()
 
 
 def create_payment_session(user_id: int, plan: str, network: str, token: str, from_block: int) -> int:
@@ -185,6 +267,23 @@ def get_pending_session(user_id: int, plan: str, network: str, token: str) -> di
     return None
 
 
+def cancel_user_payment_sessions(user_id: int) -> int:
+    """Отменяет все pending-сессии пользователя. Возвращает кол-во отменённых."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE payment_sessions SET status = 'cancelled' "
+        "WHERE user_id = ? AND status = 'pending'",
+        (user_id,),
+    )
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    if count:
+        logger.info(f"Cancelled {count} payment session(s) for user {user_id}")
+    return count
+
+
 def complete_payment_session(session_id: int) -> None:
     """Помечает сессию как completed."""
     conn = _get_connection()
@@ -231,16 +330,24 @@ async def check_payment(user_id: int, plan: str, network: str, token: str) -> di
         return None
 
     # Получаем адрес кошелька пользователя
+    _ensure_all_wallets(user_id)
     conn = _get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT wallet_address FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT wallet_address, sol_wallet_address FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     conn.close()
     if not row:
         logger.warning(f"check_payment: no wallet for user {user_id}")
         return None
 
-    wallet = row["wallet_address"]
+    net_info = SUPPORTED_NETWORKS.get(network, {})
+    net_type = net_info.get("type", "evm")
+    if net_type == "solana":
+        wallet = row["sol_wallet_address"]
+    elif net_type == "tron":
+        wallet = eth_to_tron_address(row["wallet_address"])
+    else:
+        wallet = row["wallet_address"]
     token_address = token_info["addresses"].get(network)
     if not token_address:
         logger.warning(f"check_payment: no token address for {token} on {network}")
@@ -348,10 +455,14 @@ def activate_subscription(user_id: int, plan: str) -> None:
 
     conn = _get_connection()
     cursor = conn.cursor()
+
+    # Удаляем все старые записи, оставляем одну актуальную
+    cursor.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
     cursor.execute(
         "INSERT INTO subscriptions (user_id, plan, status, expires_at) VALUES (?, ?, 'active', ?)",
         (user_id, plan, expires_at.isoformat() if expires_at else None),
     )
+
     conn.commit()
     conn.close()
     logger.info(f"Activated subscription '{plan}' for user {user_id}")

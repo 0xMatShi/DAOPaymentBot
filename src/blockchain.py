@@ -444,7 +444,29 @@ async def verify_tron_transaction(
     if not ret or ret[0].get("contractRet") != "SUCCESS":
         return False, "Транзакция не успешна", 0.0
 
-    # Парсим contract calls
+    # Проверяем, есть ли TRC-20 переводы в транзакции
+    trc20_transfers = data.get("trc20TransferInfo", [])
+
+    if trc20_transfers:
+        # Это TRC-20 транзакция - ищем перевод на нужный адрес
+        for transfer in trc20_transfers:
+            to_address = transfer.get("to_address", "")
+            contract_address = transfer.get("contract_address", "")
+
+            # Проверяем адрес получателя и контракт токена
+            if to_address == expected_to and contract_address == expected_token:
+                amount_raw = int(transfer.get("amount_str", "0"))
+                amount = amount_raw / (10 ** decimals)
+
+                if amount < min_amount:
+                    return False, f"Недостаточная сумма ({amount} < {min_amount})", amount
+
+                return True, "", amount
+
+        # Если дошли сюда - не нашли подходящий перевод
+        return False, f"Перевод USDT на адрес {expected_to} не найден в транзакции", 0.0
+
+    # Если нет TRC-20 переводов, проверяем обычный TRX перевод (старая логика)
     contract = data.get("raw_data", {}).get("contract", [])
     if not contract:
         return False, "Некорректная структура транзакции", 0.0

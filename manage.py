@@ -167,7 +167,7 @@ def cancel_subscription(user_id: int) -> None:
 def show_user_detail(user: dict) -> None:
     import sys
     sys.path.insert(0, ".")
-    from src.payments import get_user_referral_info
+    from src.payments import get_user_referral_info, get_user_own_referral_code
 
     while True:
         clear()
@@ -189,15 +189,22 @@ def show_user_detail(user: dict) -> None:
         else:
             print("  Подписка:    нет")
 
-        # Показываем реферальную информацию
+        # Показываем реферальную информацию (по какой ссылке пришёл)
         if ref_info:
-            print(f"  Реф. код:    {ref_info['code']}")
+            print(f"  Пришёл по:   {ref_info['code']}")
             if ref_info['name']:
-                print(f"  Реф. ссылка: {ref_info['name']}")
+                print(f"  Название:    {ref_info['name']}")
             else:
-                print(f"  Реф. ссылка: без названия")
+                print(f"  Название:    без названия")
         else:
-            print("  Реф. ссылка: нет")
+            print("  Пришёл по:   нет")
+
+        # Показываем личный реф. код пользователя
+        own_code = get_user_own_referral_code(user["user_id"])
+        if own_code:
+            print(f"  Личный код:  {own_code}")
+        else:
+            print("  Личный код:  не создан")
 
         print("=" * 50 + "\n")
 

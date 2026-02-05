@@ -34,6 +34,7 @@ from src.payments import (
     get_user_referral_code,
     get_user_referral_info,
     get_plan_price_for_user,
+    get_user_own_referral_code,
 )
 
 router = Router()
@@ -501,14 +502,25 @@ async def show_profile(callback: CallbackQuery) -> None:
     else:
         status_text = "У вас нет активной подписки."
 
+    # Получаем личную реферальную ссылку (только для пользователей с активной подпиской)
+    referral_text = ""
+    if subscription:
+        own_referral_code = get_user_own_referral_code(user_id)
+        if own_referral_code:
+            bot_info = await callback.bot.get_me() # type: ignore
+            bot_username = bot_info.username if bot_info and bot_info.username else "PaymentDAOBot"
+            referral_url = f"https://t.me/{bot_username}?start={own_referral_code}"
+            referral_text = f"\n\n🔗 Ваша реферальная ссылка:\n<code>{referral_url}</code>\n\nПриглашайте друзей и получайте +3 дня к подписке за каждую оплату!"
+
     text = (
         f"Личный кабинет\n\n"
         f"ID: {user_id}\n"
         f"{status_text}"
+        f"{referral_text}"
     )
 
     logger.info(f"User {user_id} opened profile")
-    await callback.message.edit_text(text, reply_markup=back_kb()) # type: ignore
+    await callback.message.edit_text(text, reply_markup=back_kb(), parse_mode=ParseMode.HTML) # type: ignore
     await callback.answer()
 
 
@@ -525,6 +537,5 @@ async def show_faq(callback: CallbackQuery) -> None:
 async def setup_bot_commands(bot: Bot) -> None:
     await bot.set_my_commands([
         BotCommand(command="start", description="Перезапустить бота"),
-        BotCommand(command="chatid", description="Получить ID чата"),
     ])
     logger.info("Bot commands configured")

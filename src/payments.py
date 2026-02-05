@@ -14,7 +14,7 @@ DB_PATH = "data/bot.db"
 PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
 
 SUBSCRIPTION_PLANS = {
-    "1month": {"label": "1 месяц", "price": 50, "duration_days": 30},
+    "1month": {"label": "1 месяц", "price": 0.1, "duration_days": 30},
     "3months": {"label": "3 месяца", "price": 120, "duration_days": 90},
     "forever": {"label": "Навсегда", "price": 250, "duration_days": None},
 }
@@ -206,6 +206,10 @@ def init_db() -> None:
     if "name" not in existing_ref:
         cursor.execute("ALTER TABLE referral_links ADD COLUMN name TEXT")
 
+    # Миграция: добавить колонку owner_user_id в referral_links для пользовательских ссылок
+    if "owner_user_id" not in existing_ref:
+        cursor.execute("ALTER TABLE referral_links ADD COLUMN owner_user_id INTEGER")
+
     conn.commit()
     conn.close()
 
@@ -315,6 +319,11 @@ def update_user_profile(user_id: int, username: str | None, first_name: str | No
 
     conn.commit()
     conn.close()
+
+    # Создаём личную реферальную ссылку при первом создании профиля
+    if not exists:
+        ensure_user_referral_link(user_id)
+        logger.info(f"Created personal referral link for new user {user_id}")
 
 
 def get_user_profile(user_id: int) -> dict | None:
@@ -471,6 +480,128 @@ def get_user_referral_info(user_id: int) -> dict | None:
     if row:
         return {"code": row["referral_code"], "name": row["name"]}
     return None
+
+
+def get_user_own_referral_code(user_id: int) -> str | None:
+    """Возвращает личный реферальный код пользователя.
+
+    Returns:
+        Код реферальной ссылки или None если ссылка ещё не создана
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT code FROM referral_links WHERE owner_user_id = ? LIMIT 1",
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return row["code"]
+    return None
+
+
+def ensure_user_referral_link(user_id: int) -> str:
+    """Создаёт личную реферальную ссылку для пользователя, если её ещё нет.
+
+    Args:
+        user_id: ID пользователя Telegram
+
+    Returns:
+        Код реферальной ссылки (существующий или новый)
+    """
+    # Проверяем, есть ли уже ссылка
+    existing_code = get_user_own_referral_code(user_id)
+    if existing_code:
+        return existing_code
+
+    # Создаём новую ссылку с дефолтными настройками
+    import secrets
+
+    code = secrets.token_urlsafe(8)
+
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO referral_links (code, max_uses, custom_prices, name, owner_user_id) "
+        "VALUES (?, NULL, NULL, NULL, ?)",
+        (code, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Created personal referral link for user {user_id}: {code}")
+    return code
+
+
+def get_referral_link_owner(referral_code: str) -> int | None:
+    """Возвращает ID владельца реферальной ссылки.
+
+    Returns:
+        user_id владельца или None если это административная ссылка или ссылка не найдена
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT owner_user_id FROM referral_links WHERE code = ?",
+        (referral_code,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row and row["owner_user_id"]:
+        return row["owner_user_id"]
+    return None
+
+
+def add_days_to_subscription(user_id: int, days: int) -> bool:
+    """Добавляет дни к активной подписке пользователя.
+
+    Args:
+        user_id: ID пользователя
+        days: Количество дней для добавления
+
+    Returns:
+        True если дни добавлены успешно, False если нет активной подписки
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+
+    # Получаем активную подписку
+    cursor.execute(
+        "SELECT id, plan, expires_at FROM subscriptions "
+        "WHERE user_id = ? AND status = 'active' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (user_id,)
+    )
+    row = cursor.fetchone()
+
+    if not row:
+        conn.close()
+        logger.warning(f"Cannot add days to user {user_id}: no active subscription")
+        return False
+
+    current_expires = row["expires_at"]
+
+    # Если подписка бессрочная, не добавляем дни
+    if not current_expires:
+        conn.close()
+        logger.info(f"User {user_id} has lifetime subscription, skipping days addition")
+        return True
+
+    # Вычисляем новую дату истечения
+    expires_dt = datetime.fromisoformat(current_expires)
+    new_expires = expires_dt + timedelta(days=days)
+
+    # Обновляем подписку
+    cursor.execute(
+        "UPDATE subscriptions SET expires_at = ? WHERE id = ?",
+        (new_expires.isoformat(), row["id"])
+    )
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Added {days} days to user {user_id} subscription (new expires: {new_expires.isoformat()})")
+    return True
 
 
 def get_all_referral_links() -> list[dict]:
@@ -721,6 +852,17 @@ def activate_subscription(user_id: int, plan: str) -> None:
     conn.commit()
     conn.close()
     logger.info(f"Activated subscription '{plan}' for user {user_id}")
+
+    # Начисляем 3 дня владельцу реферальной ссылки, если пользователь пришёл по чьей-то ссылке
+    referral_code = get_user_referral_code(user_id)
+    if referral_code:
+        owner_id = get_referral_link_owner(referral_code)
+        if owner_id:
+            success = add_days_to_subscription(owner_id, 3)
+            if success:
+                logger.info(f"✓ Awarded 3 days to referral link owner {owner_id} (referrer of user {user_id})")
+            else:
+                logger.info(f"Referral link owner {owner_id} has no active subscription, skipping reward")
 
 
 async def create_invite_link(bot: Bot, user_id: int, plan_name: str) -> str:

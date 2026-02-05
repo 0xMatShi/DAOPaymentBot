@@ -107,15 +107,15 @@ def back_kb(callback_data: str = "back_to_main") -> InlineKeyboardMarkup:
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     user = message.from_user  # type: ignore
-    logger.info(f"User {user.id} started the bot")
+    logger.info(f"User {user.id} started the bot") # type: ignore
 
     # Сохраняем/обновляем профиль пользователя
-    update_user_profile(user.id, user.username, user.first_name, user.last_name)
+    update_user_profile(user.id, user.username, user.first_name, user.last_name) # type: ignore
 
     # Очищаем FSM при рестарте
     await state.clear()
 
-    cancel_user_payment_sessions(user.id)
+    cancel_user_payment_sessions(user.id) # type: ignore
     await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_kb())
 
 
@@ -124,12 +124,12 @@ async def get_chat_id_command(message: Message) -> None:
     """Получить ID текущего чата (для настройки канала/группы)"""
     chat_info = (
         f"📋 Информация о чате:\n\n"
-        f"ID: `{message.chat.id}`\n"
+        f"ID: <code>{message.chat.id}</code>\n"
         f"Тип: {message.chat.type}\n"
         f"Название: {message.chat.title or 'Личные сообщения'}"
     )
     logger.info(f"Chat ID request: {message.chat.id}, type: {message.chat.type}, title: {message.chat.title}")
-    await message.answer(chat_info, parse_mode=ParseMode.MARKDOWN)
+    await message.answer(chat_info, parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data == "back_to_main")
@@ -235,7 +235,7 @@ async def show_payment(callback: CallbackQuery, state: FSMContext) -> None:
         f"Оплата подписки: {plan['label']}\n\n"
         f"Переведите {plan['price']}$ {tok['name']} в сети {net['name']} "
         f"на адрес ниже:\n\n"
-        f"`{wallet_address}`\n\n"
+        f"<code>{wallet_address}</code>\n\n"
         f"После перевода нажмите \"Подтвердить оплату\" и отправьте хэш транзакции."
     )
 
@@ -243,7 +243,7 @@ async def show_payment(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(  # type: ignore
         text,
         reply_markup=payment_kb(plan_id, network, token),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
     await callback.answer()
 
@@ -361,14 +361,14 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
         f"Подписка: {plan.get('label', plan_id)}\n"
         f"Сумма: {amount} {tok.get('name', token)}\n"
         f"Сеть: {net.get('name', network)}\n"
-        f"Tx: `{tx_hash}`"
+        f"Tx: <code>{tx_hash}</code>"
         f"{link_text}"
     )
 
     await message.answer(
         success_text,
         reply_markup=back_kb(),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
     # Нотификация администратора

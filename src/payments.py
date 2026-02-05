@@ -80,24 +80,6 @@ def eth_to_tron_address(eth_address: str) -> str:
     return base58.b58encode(prefixed + h2[:4]).decode()
 
 
-def get_wallet_for_network(user_id: int, network: str) -> str:
-    """Возвращает адрес кошелька в формате нужной сети."""
-    _ensure_all_wallets(user_id)
-    net = SUPPORTED_NETWORKS.get(network, {})
-    net_type = net.get("type", "evm")
-
-    if net_type == "solana":
-        conn = _get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT sol_wallet_address FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        conn.close()
-        return row["sol_wallet_address"]
-
-    eth_address = get_or_create_wallet(user_id)
-    if net_type == "tron":
-        return eth_to_tron_address(eth_address)
-    return eth_address
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -294,54 +276,8 @@ def check_tx_hash_already_used(tx_hash: str) -> bool:
     return count > 0
 
 
-def get_or_create_wallet(user_id: int) -> str:
-    """Возвращает EVM-адрес, создавая все кошельки при необходимости."""
-    conn = _get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT wallet_address FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-
-    if row:
-        conn.close()
-        return row["wallet_address"]
-
-    account = Account.create()
-    sol_kp = Keypair()
-
-    cursor.execute(
-        "INSERT INTO users (user_id, wallet_address, private_key, sol_wallet_address, sol_private_key) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (user_id, account.address, account.key.hex(),
-         str(sol_kp.pubkey()), base58.b58encode(bytes(sol_kp)).decode()),
-    )
-    conn.commit()
-    conn.close()
-    logger.info(f"Created wallets for user {user_id}: EVM={account.address}, SOL={sol_kp.pubkey()}")
-    return account.address
 
 
-def _ensure_all_wallets(user_id: int) -> None:
-    """Догенерирует недостающие кошельки для существующего пользователя."""
-    conn = _get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT sol_wallet_address FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-
-    if not row:
-        conn.close()
-        get_or_create_wallet(user_id)
-        return
-
-    if not row["sol_wallet_address"]:
-        sol_kp = Keypair()
-        cursor.execute(
-            "UPDATE users SET sol_wallet_address = ?, sol_private_key = ? WHERE user_id = ?",
-            (str(sol_kp.pubkey()), base58.b58encode(bytes(sol_kp)).decode(), user_id),
-        )
-        conn.commit()
-        logger.info(f"Generated Solana wallet for existing user {user_id}: {sol_kp.pubkey()}")
-
-    conn.close()
 
 
 def create_payment_session(user_id: int, plan: str, network: str, token: str, from_block: int) -> int:
@@ -434,78 +370,6 @@ def record_payment(user_id: int, amount: float, plan: str, network: str, token: 
     logger.info(f"Recorded payment for user {user_id}: {amount} {token} on {network}, tx={tx_hash}")
 
 
-async def check_payment(user_id: int, plan: str, network: str, token: str) -> dict | None:
-    """Проверка поступления оплаты через сканирование Transfer-событий.
-
-    Возвращает {"tx_hash": str, "amount": float} при успехе или None.
-    """
-    from src.blockchain import scan_incoming_transfers
-
-    plan_info = SUBSCRIPTION_PLANS.get(plan)
-    token_info = SUPPORTED_TOKENS.get(token)
-    if not plan_info or not token_info:
-        logger.warning(f"check_payment: unknown plan={plan} or token={token}")
-        return None
-
-    session = get_pending_session(user_id, plan, network, token)
-    if not session:
-        logger.warning(f"check_payment: no pending session for user {user_id}, plan={plan}, {network}/{token}")
-        return None
-
-    # Получаем адрес кошелька пользователя
-    _ensure_all_wallets(user_id)
-    conn = _get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT wallet_address, sol_wallet_address FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if not row:
-        logger.warning(f"check_payment: no wallet for user {user_id}")
-        return None
-
-    net_info = SUPPORTED_NETWORKS.get(network, {})
-    net_type = net_info.get("type", "evm")
-    if net_type == "solana":
-        wallet = row["sol_wallet_address"]
-    elif net_type == "tron":
-        wallet = eth_to_tron_address(row["wallet_address"])
-    else:
-        wallet = row["wallet_address"]
-    token_address = token_info["addresses"].get(network)
-    if not token_address:
-        logger.warning(f"check_payment: no token address for {token} on {network}")
-        return None
-
-    logger.info(f"Checking payment for user {user_id}: scanning transfers to {wallet} on {network}/{token} from block {session['from_block']}")
-
-    transfers = await scan_incoming_transfers(
-        network=network,
-        token_address=token_address,
-        wallet=wallet,
-        from_block=session["from_block"],
-    )
-
-    if not transfers:
-        return None
-
-    # Суммируем все входящие переводы
-    decimals = token_info["decimals"]
-    total_amount = sum(t["amount"] / (10 ** decimals) for t in transfers)
-    required_amount = plan_info["price"]
-
-    logger.info(f"User {user_id}: received {total_amount} {token_info['name']}, required {required_amount}")
-
-    if total_amount >= required_amount:
-        # Используем хеш последнего трансфера как основной
-        tx_hash = transfers[-1]["tx_hash"]
-
-        record_payment(user_id, total_amount, plan, network, token, tx_hash)
-        activate_subscription(user_id, plan)
-        complete_payment_session(session["id"])
-
-        return {"tx_hash": tx_hash, "amount": total_amount}
-
-    return None
 
 
 def get_user_subscription(user_id: int) -> dict | None:

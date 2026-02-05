@@ -19,13 +19,21 @@ def get_connection() -> sqlite3.Connection:
 
 
 def get_all_users() -> list[dict]:
+    """Получает всех пользователей из subscriptions и payments (без дубликатов)."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT user_id, wallet_address, private_key, "
-        "sol_wallet_address, sol_private_key FROM users ORDER BY user_id"
-    )
-    users = [dict(row) for row in cursor.fetchall()]
+
+    # Собираем уникальные user_id из subscriptions и payments
+    cursor.execute("""
+        SELECT DISTINCT user_id
+        FROM (
+            SELECT user_id FROM subscriptions
+            UNION
+            SELECT user_id FROM payments
+        )
+        ORDER BY user_id
+    """)
+    users = [{"user_id": row["user_id"]} for row in cursor.fetchall()]
     conn.close()
     return users
 
@@ -158,10 +166,6 @@ def show_user_detail(user: dict) -> None:
             print(f"  Истекает:    {format_expires(sub['expires_at'])}")
         else:
             print("  Подписка:    нет")
-        print(f"  EVM адрес:   {user['wallet_address']}")
-        print(f"  EVM ключ:    {user['private_key']}")
-        print(f"  SOL адрес:   {user.get('sol_wallet_address') or 'не создан'}")
-        print(f"  SOL ключ:    {user.get('sol_private_key') or 'не создан'}")
         print("=" * 50 + "\n")
 
         action = inquirer.select(  # type: ignore

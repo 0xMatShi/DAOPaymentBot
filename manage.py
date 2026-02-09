@@ -566,13 +566,17 @@ def menu_check_balance() -> None:
     print(f"{'Сеть':<20} {'Токен':<8} {'Баланс':>15}")
     print("-" * 70)
 
+    total = 0.0
     for r in results:
         if r["balance"] is not None:
             balance_str = f"{r['balance']:.2f}"
+            total += r["balance"]
         else:
             balance_str = "ошибка"
         print(f"{r['network']:<20} {r['token']:<8} {balance_str:>15}")
 
+    print("-" * 70)
+    print(f"{'ИТОГО':<29} {'$' + f'{total:.2f}':>15}")
     print("=" * 70 + "\n")
     inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
 

@@ -1,7 +1,9 @@
+import asyncio
 import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 
+import aiohttp
 from InquirerPy import inquirer
 
 DB_PATH = "data/bot.db"
@@ -418,16 +420,175 @@ def menu_new_referral() -> None:
     inquirer.select(message="", choices=["< Nazad"]).execute()  # type: ignore
 
 
+# ── Check Balance ──────────────────────────────────────────
+
+# ERC-20 balanceOf(address) selector
+_BALANCE_OF_SELECTOR = "0x70a08231"
+
+
+async def _evm_token_balance(rpc_url: str, token_address: str, wallet: str) -> int:
+    """Получает баланс ERC-20 токена через eth_call."""
+    padded_wallet = "0x" + wallet[2:].lower().zfill(64)
+    data = _BALANCE_OF_SELECTOR + padded_wallet[2:]
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": token_address, "data": data}, "latest"],
+        "id": 1,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            result = await resp.json()
+    raw = result.get("result", "0x0")
+    return int(raw, 16)
+
+
+async def _tron_token_balance(api_url: str, token_address: str, wallet: str) -> int:
+    """Получает баланс TRC-20 токена через TronGrid API."""
+    api_key = os.getenv("TRONGRID_API_KEY", "")
+    headers = {}
+    if api_key:
+        headers["TRON-PRO-API-KEY"] = api_key
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(
+            f"{api_url}/v1/accounts/{wallet}",
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            data = await resp.json()
+
+    # Ищем токен в trc20-балансах
+    accounts = data.get("data", [])
+    if not accounts:
+        return 0
+    for token_entry in accounts[0].get("trc20", []):
+        if isinstance(token_entry, dict):
+            balance = token_entry.get(token_address)
+            if balance is not None:
+                return int(balance)
+    return 0
+
+
+async def _solana_token_balance(rpc_url: str, token_mint: str, wallet: str) -> int:
+    """Получает баланс SPL-токена через Solana RPC."""
+    from solders.pubkey import Pubkey
+
+    _SOL_TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+    _SOL_ATA_PROGRAM = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+
+    wallet_pk = Pubkey.from_string(wallet)
+    mint_pk = Pubkey.from_string(token_mint)
+    ata, _ = Pubkey.find_program_address(
+        [bytes(wallet_pk), bytes(_SOL_TOKEN_PROGRAM), bytes(mint_pk)],
+        _SOL_ATA_PROGRAM,
+    )
+
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "getTokenAccountBalance",
+        "params": [str(ata), {"commitment": "confirmed"}],
+        "id": 1,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            data = await resp.json()
+
+    if "error" in data:
+        return 0
+    return int(data.get("result", {}).get("value", {}).get("amount", "0"))
+
+
+async def _fetch_all_balances() -> list[dict]:
+    """Собирает балансы всех токенов на всех мастер-кошельках."""
+    import sys
+    sys.path.insert(0, ".")
+    from src.payments import SUPPORTED_NETWORKS, SUPPORTED_TOKENS, get_master_wallet_address
+
+    results = []
+
+    for net_id, net_info in SUPPORTED_NETWORKS.items():
+        wallet = get_master_wallet_address(net_id)
+        if not wallet:
+            continue
+
+        net_type = net_info.get("type")
+
+        for tok_id, tok_info in SUPPORTED_TOKENS.items():
+            # USDC не поддерживается в Tron
+            if tok_id == "usdc" and net_id == "tron":
+                continue
+
+            token_address = tok_info["addresses"].get(net_id)
+            if not token_address:
+                continue
+
+            decimals = tok_info["decimals"]
+
+            try:
+                if net_type == "evm":
+                    rpc_url = os.getenv(net_info["rpc_url_env"], net_info["rpc_url_default"])
+                    raw = await _evm_token_balance(rpc_url, token_address, wallet)
+                elif net_type == "tron":
+                    api_url = os.getenv(net_info.get("api_url_env", ""), net_info.get("api_url_default", ""))
+                    raw = await _tron_token_balance(api_url, token_address, wallet)
+                elif net_type == "solana":
+                    rpc_url = os.getenv(net_info["rpc_url_env"], net_info["rpc_url_default"])
+                    raw = await _solana_token_balance(rpc_url, token_address, wallet)
+                else:
+                    continue
+
+                balance = raw / (10 ** decimals)
+            except Exception as e:
+                balance = None
+                print(f"  [!] Ошибка при запросе {tok_info['name']} на {net_info['name']}: {e}")
+
+            results.append({
+                "network": net_info["name"],
+                "token": tok_info["name"],
+                "wallet": wallet,
+                "balance": balance,
+            })
+
+    return results
+
+
+def menu_check_balance() -> None:
+    """Проверка балансов USDT/USDC на мастер-кошельках."""
+    clear()
+    print("Загрузка балансов...\n")
+
+    results = asyncio.run(_fetch_all_balances())
+
+    clear()
+    print("=" * 70)
+    print("БАЛАНСЫ МАСТЕР-КОШЕЛЬКОВ")
+    print("=" * 70)
+    print(f"{'Сеть':<20} {'Токен':<8} {'Баланс':>15}")
+    print("-" * 70)
+
+    for r in results:
+        if r["balance"] is not None:
+            balance_str = f"{r['balance']:.2f}"
+        else:
+            balance_str = "ошибка"
+        print(f"{r['network']:<20} {r['token']:<8} {balance_str:>15}")
+
+    print("=" * 70 + "\n")
+    inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+
+
 def main() -> None:
     clear()
     while True:
         action = inquirer.select( # type: ignore
             message="Управление ботом:",
-            choices=["Users", "View Master Wallets", "Export Master Wallets", "New Referral", "Exit"],
+            choices=["Users", "Check Balance", "View Master Wallets", "Export Master Wallets", "New Referral", "Exit"],
         ).execute()
 
         if action == "Users":
             menu_users()
+        elif action == "Check Balance":
+            menu_check_balance()
         elif action == "View Master Wallets":
             menu_view_master_wallets()
         elif action == "Export Master Wallets":

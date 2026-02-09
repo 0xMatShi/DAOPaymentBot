@@ -1,5 +1,6 @@
 import asyncio
 import os
+import secrets
 import sqlite3
 from datetime import datetime, timezone, timedelta
 
@@ -279,8 +280,13 @@ def menu_view_master_wallets() -> None:
     inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
 
 
+def _is_key_wiped(private_key: str) -> bool:
+    """Проверяет, был ли приватный ключ уже затёрт (заменён на пустышку)."""
+    return private_key.startswith("WIPED_")
+
+
 def menu_export_wallets() -> None:
-    """Экспортирует только мастер-кошельки."""
+    """Экспортирует мастер-кошельки и затирает приватные ключи в БД."""
     clear()
 
     conn = get_connection()
@@ -289,13 +295,42 @@ def menu_export_wallets() -> None:
         "SELECT network, wallet_address, private_key FROM master_wallets ORDER BY network"
     )
     wallets = [dict(row) for row in cursor.fetchall()]
-    conn.close()
 
     if not wallets:
+        conn.close()
         print("Мастер-кошельки не найдены.\n")
         inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
         return
 
+    # Проверяем, есть ли ещё настоящие ключи
+    real_keys = [w for w in wallets if not _is_key_wiped(w["private_key"])]
+    if not real_keys:
+        conn.close()
+        print("Приватные ключи уже были экспортированы и затёрты.\n")
+        print("В базе данных хранятся только пустышки.\n")
+        inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+        return
+
+    # Предупреждение
+    print("=" * 80)
+    print("ЭКСПОРТ МАСТЕР-КОШЕЛЬКОВ")
+    print("=" * 80)
+    print()
+    print("После экспорта приватные ключи в базе данных будут")
+    print("БЕЗВОЗВРАТНО заменены на случайные пустышки.")
+    print()
+    print("Сохраните экспортированный файл в надёжное место!\n")
+
+    confirm = inquirer.select(  # type: ignore
+        message="Продолжить?",
+        choices=["Да, экспортировать и затереть ключи", "< Отмена"],
+    ).execute()
+
+    if confirm == "< Отмена":
+        conn.close()
+        return
+
+    # Экспорт в файл
     os.makedirs("data", exist_ok=True)
     filepath = "data/master_wallets_export.txt"
 
@@ -308,8 +343,19 @@ def menu_export_wallets() -> None:
             f.write(f"Приватный ключ: {w['private_key']}\n")
             f.write("-" * 80 + "\n")
 
-    print(f"\nЭкспортировано {len(wallets)} мастер-кошельков в {filepath}\n")
-    print("⚠️  ВАЖНО: Этот файл содержит приватные ключи. Удалите его после сохранения в безопасное место!")
+    # Затираем ключи в БД
+    for w in wallets:
+        if not _is_key_wiped(w["private_key"]):
+            dummy = "WIPED_" + secrets.token_hex(32)
+            cursor.execute(
+                "UPDATE master_wallets SET private_key = ? WHERE network = ?",
+                (dummy, w["network"]),
+            )
+    conn.commit()
+    conn.close()
+
+    print(f"\nЭкспортировано {len(wallets)} мастер-кошельков в {filepath}")
+    print("Приватные ключи в БД затёрты.\n")
     inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
 
 

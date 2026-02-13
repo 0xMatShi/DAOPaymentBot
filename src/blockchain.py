@@ -404,6 +404,14 @@ async def verify_evm_transaction(
     return True, "", amount
 
 
+def _tron_base58_to_hex(address: str) -> str:
+    """Конвертирует Tron base58check адрес в 20-байтный hex (без префикса 41)."""
+    import base58
+    decoded = base58.b58decode(address)
+    # decoded = 1 byte prefix (0x41) + 20 bytes address + 4 bytes checksum
+    return decoded[1:21].hex()
+
+
 async def verify_tron_transaction(
     network: str,
     tx_hash: str,
@@ -419,7 +427,7 @@ async def verify_tron_transaction(
     """
     url = _get_trongrid_url(network)
     api_key = os.getenv("TRONGRID_API_KEY", "")
-    headers = {}
+    headers = {"Content-Type": "application/json"}
     if api_key:
         headers["TRON-PRO-API-KEY"] = api_key
 
@@ -428,66 +436,59 @@ async def verify_tron_transaction(
 
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(
-                f"{url}/v1/transactions/{tx_id}",
+            # Получаем данные транзакции
+            async with session.post(
+                f"{url}/walletsolidity/gettransactionbyid",
+                json={"value": tx_id},
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
-                if resp.status == 404:
-                    return False, "Транзакция не найдена", 0.0
-                data = await resp.json()
+                tx_data = await resp.json()
+
+            if not tx_data or "txID" not in tx_data:
+                return False, "Транзакция не найдена", 0.0
+
+            # Проверяем успешность
+            ret = tx_data.get("ret", [])
+            if not ret or ret[0].get("contractRet") != "SUCCESS":
+                return False, "Транзакция не успешна", 0.0
+
+            # Получаем info с логами TRC-20 Transfer
+            async with session.post(
+                f"{url}/walletsolidity/gettransactioninfobyid",
+                json={"value": tx_id},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                tx_info = await resp.json()
+
     except Exception as e:
         logger.error(f"Failed to get Tron tx: {e}")
         return False, "Ошибка при запросе к сети Tron", 0.0
 
-    # Проверяем успешность
-    ret = data.get("ret", [])
-    if not ret or ret[0].get("contractRet") != "SUCCESS":
-        return False, "Транзакция не успешна", 0.0
+    # Парсим TRC-20 Transfer из логов
+    logs = tx_info.get("log", [])
+    transfer_sig = TRANSFER_EVENT_TOPIC[2:]  # без 0x
 
-    # Проверяем, есть ли TRC-20 переводы в транзакции
-    trc20_transfers = data.get("trc20TransferInfo", [])
+    expected_to_hex = _tron_base58_to_hex(expected_to)
+    expected_token_hex = _tron_base58_to_hex(expected_token)
 
-    if trc20_transfers:
-        # Это TRC-20 транзакция - ищем перевод на нужный адрес
-        for transfer in trc20_transfers:
-            to_address = transfer.get("to_address", "")
-            contract_address = transfer.get("contract_address", "")
+    for log_entry in logs:
+        topics = log_entry.get("topics", [])
+        if len(topics) < 3 or topics[0] != transfer_sig:
+            continue
 
-            # Проверяем адрес получателя и контракт токена
-            if to_address == expected_to and contract_address == expected_token:
-                amount_raw = int(transfer.get("amount_str", "0"))
-                amount = amount_raw / (10 ** decimals)
+        contract_hex = log_entry.get("address", "")
+        to_hex = topics[2][-40:]  # последние 20 байт
 
-                if amount < min_amount:
-                    return False, f"Недостаточная сумма ({amount} < {min_amount})", amount
+        if contract_hex == expected_token_hex and to_hex == expected_to_hex:
+            amount_raw = int(log_entry.get("data", "0"), 16)
+            amount = amount_raw / (10 ** decimals)
 
-                return True, "", amount
+            if amount < min_amount:
+                return False, f"Недостаточная сумма ({amount} < {min_amount})", amount
 
-        # Если дошли сюда - не нашли подходящий перевод
-        return False, f"Перевод USDT на адрес {expected_to} не найден в транзакции", 0.0
+            return True, "", amount
 
-    # Если нет TRC-20 переводов, проверяем обычный TRX перевод (старая логика)
-    contract = data.get("raw_data", {}).get("contract", [])
-    if not contract:
-        return False, "Некорректная структура транзакции", 0.0
-
-    parameter = contract[0].get("parameter", {}).get("value", {})
-    to_address = parameter.get("to")
-    amount_raw = parameter.get("amount", 0)
-
-    if not to_address:
-        return False, "Отсутствуют данные о получателе", 0.0
-
-    # Сравниваем адреса (base58)
-    if to_address != expected_to:
-        return False, f"Получатель не совпадает (ожидается {expected_to})", 0.0
-
-    amount = amount_raw / (10 ** decimals)
-
-    if amount < min_amount:
-        return False, f"Недостаточная сумма ({amount} < {min_amount})", amount
-
-    return True, "", amount
+    return False, f"Перевод на адрес {expected_to} не найден в транзакции", 0.0
 
 
 async def verify_solana_transaction(

@@ -58,6 +58,14 @@ def get_all_users() -> list[dict]:
     return users
 
 
+def get_active_users_list() -> list[dict]:
+    """Получает пользователей с активной подпиской."""
+    import sys
+    sys.path.insert(0, ".")
+    from src.payments import get_active_users
+    return get_active_users()
+
+
 def get_user_subscription(user_id: int) -> dict | None:
     conn = get_connection()
     cursor = conn.cursor()
@@ -271,6 +279,71 @@ def menu_users() -> None:
         # Извлекаем user_id из выбранной строки (первое число до " |")
         user_id_str = selected.split(" |")[0] if " |" in selected else selected
         user = next(u for u in users if str(u["user_id"]) == user_id_str)
+        show_user_detail(user)
+
+
+def menu_active_users() -> None:
+    """Меню активных пользователей (только с подпиской)."""
+    clear()
+    users = get_active_users_list()
+    if not users:
+        print("Активных пользователей (с подпиской) пока нет.\n")
+        inquirer.select(message="", choices=["< Назад"]).execute() # type: ignore
+        return
+
+    while True:
+        clear()
+        print("=" * 80)
+        print("АКТИВНЫЕ ПОЛЬЗОВАТЕЛИ (С ПОДПИСКОЙ)")
+        print("=" * 80)
+        print(f"{'ID':<12} {'Username/Имя':<25} {'План':<15} {'Истекает':<25}")
+        print("-" * 80)
+
+        choices_map = {}
+        for idx, u in enumerate(users, 1):
+            user_id = u["user_id"]
+            username = u.get("username")
+            first_name = u.get("first_name")
+
+            # Форматируем отображение пользователя
+            if username:
+                user_display = f"@{username}"
+            elif first_name:
+                user_display = first_name
+            else:
+                user_display = str(user_id)
+
+            # Форматируем план
+            plan = u.get("plan", "N/A")
+            plan_label = PLAN_LABELS.get(plan, plan)
+
+            # Форматируем дату истечения
+            expires_at = u.get("expires_at")
+            if expires_at:
+                expires_str = format_expires(expires_at)
+            else:
+                expires_str = "Навсегда"
+
+            print(f"{user_id:<12} {user_display:<25} {plan_label:<15} {expires_str:<25}")
+
+            # Для выбора
+            choice_text = f"{user_id} | {user_display}"
+            choices_map[choice_text] = u
+
+        print("=" * 80 + "\n")
+
+        choices = list(choices_map.keys())
+        choices.append("< Назад")
+
+        selected = inquirer.select( # type: ignore
+            message="Выберите пользователя для деталей:",
+            choices=choices,
+        ).execute()
+
+        if selected == "< Назад":
+            return
+
+        user = choices_map[selected]
         show_user_detail(user)
 
 
@@ -754,11 +827,13 @@ def main() -> None:
     while True:
         action = inquirer.select( # type: ignore
             message="Управление ботом:",
-            choices=["Users", "Check Balance", "View Master Wallets", "Export Master Wallets", "New Referral", "Exit"],
+            choices=["Users", "Active Users", "Check Balance", "View Master Wallets", "Export Master Wallets", "New Referral", "Exit"],
         ).execute()
 
         if action == "Users":
             menu_users()
+        elif action == "Active Users":
+            menu_active_users()
         elif action == "Check Balance":
             menu_check_balance()
         elif action == "View Master Wallets":

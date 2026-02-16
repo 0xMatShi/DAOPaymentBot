@@ -323,6 +323,27 @@ async def show_plans(callback: CallbackQuery) -> None:
     update_user_profile(user.id, user.username, user.first_name, user.last_name)
     logger.info(f"User {user.id} opened subscription plans")
 
+    # Проверяем активную подписку
+    subscription = get_user_subscription(user.id)
+    if subscription and subscription["expires_at"]:
+        # Есть активная подписка с датой истечения
+        expires_dt = datetime.fromisoformat(subscription["expires_at"])
+        now = datetime.now(timezone.utc)
+        time_until_expiry = expires_dt - now
+
+        # Если до истечения больше 3 дней - блокируем продление
+        if time_until_expiry > timedelta(days=3):
+            expires_msk = expires_dt.astimezone(timezone(timedelta(hours=3)))
+            await safe_edit_message(
+                callback,
+                f"У вас уже есть активная подписка!\n\n"
+                f"Дата истечения: {expires_msk.strftime('%d.%m.%Y %H:%M')} (МСК)\n\n"
+                f"Продление станет доступно за 3 дня до истечения подписки.",
+                reply_markup=back_kb(),
+            )
+            await callback.answer()
+            return
+
     # Проверяем, есть ли у пользователя реферальный код с кастомными ценами
     custom_prices = None
     referral_code = get_user_referral_code(user.id)
@@ -344,9 +365,20 @@ async def show_plans(callback: CallbackQuery) -> None:
     else:
         logger.info(f"No referral code for user {user.id}")
 
+    # Если можем продлять - показываем информацию об этом
+    message_text = "Выберите одну из предложенных подписок:"
+    if subscription and subscription["expires_at"]:
+        expires_dt = datetime.fromisoformat(subscription["expires_at"])
+        expires_msk = expires_dt.astimezone(timezone(timedelta(hours=3)))
+        message_text = (
+            f"📝 У вас активная подписка до {expires_msk.strftime('%d.%m.%Y %H:%M')} (МСК)\n\n"
+            f"При оплате новой подписки дни будут добавлены к текущей!\n\n"
+            f"Выберите подписку для продления:"
+        )
+
     await safe_edit_message(
         callback,
-        "Выберите одну из предложенных подписок:",
+        message_text,
         reply_markup=plans_kb(custom_prices),
     )
     await callback.answer()
@@ -565,8 +597,11 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
     # Записываем платёж
     record_payment(user_id, amount, plan_id, network, token, tx_hash)
 
-    # Активируем подписку
-    activate_subscription(user_id, plan_id)
+    # Активируем подписку (или продлеваем существующую)
+    result = activate_subscription(user_id, plan_id)
+    action = result.get("action")
+    expires_at = result.get("expires_at")
+    days_added = result.get("days_added")
 
     # Обновляем tx_hash в сессии и помечаем completed
     if session_id:
@@ -595,14 +630,31 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
         logger.error(f"Failed to create invite links for user {user_id}: {e}")
         link_text = "\n\n⚠️ Не удалось создать пригласительные ссылки. Обратитесь в поддержку."
 
-    success_text = (
-        f"✅ Оплата подтверждена!\n\n"
-        f"Подписка: {plan.get('label', plan_id)}\n"
-        f"Сумма: {amount} {tok.get('name', token)}\n"
-        f"Сеть: {net.get('name', network)}\n"
-        f"Tx: <code>{tx_hash}</code>"
-        f"{link_text}"
-    )
+    # Формируем сообщение в зависимости от действия
+    if action == "extended" and expires_at and days_added:
+        # Продление существующей подписки
+        expires_dt = datetime.fromisoformat(expires_at).astimezone(timezone(timedelta(hours=3)))
+        expires_str = expires_dt.strftime('%d.%m.%Y %H:%M')
+
+        success_text = (
+            f"✅ Оплата подтверждена!\n\n"
+            f"К вашей подписке добавлено {days_added} дней!\n\n"
+            f"Новая дата истечения: {expires_str} (МСК)\n\n"
+            f"Сумма: {amount} {tok.get('name', token)}\n"
+            f"Сеть: {net.get('name', network)}\n"
+            f"Tx: <code>{tx_hash}</code>"
+            f"{link_text}"
+        )
+    else:
+        # Новая подписка
+        success_text = (
+            f"✅ Оплата подтверждена!\n\n"
+            f"Подписка: {plan.get('label', plan_id)}\n"
+            f"Сумма: {amount} {tok.get('name', token)}\n"
+            f"Сеть: {net.get('name', network)}\n"
+            f"Tx: <code>{tx_hash}</code>"
+            f"{link_text}"
+        )
 
     await safe_send_message(
         message,

@@ -202,6 +202,19 @@ def init_db() -> None:
         )
     """)
 
+    # Создать таблицу для отслеживания уведомлений об истечении подписки
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS expiry_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            subscription_id INTEGER NOT NULL,
+            notification_type TEXT NOT NULL,
+            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_profiles (user_id),
+            FOREIGN KEY (subscription_id) REFERENCES subscriptions (id)
+        )
+    """)
+
     # Миграция: добавить колонку name в referral_links
     existing_ref = {row[1] for row in cursor.execute("PRAGMA table_info(referral_links)").fetchall()}
     if "name" not in existing_ref:
@@ -847,40 +860,117 @@ def deactivate_expired_subscriptions() -> list[dict]:
     return [{"user_id": r["user_id"], "plan": r["plan"]} for r in rows]
 
 
-def activate_subscription(user_id: int, plan: str) -> None:
+def activate_subscription(user_id: int, plan: str) -> dict:
+    """Активирует подписку для пользователя.
+
+    Если у пользователя уже есть активная подписка с датой истечения:
+    - Добавляет дни к существующей дате истечения
+
+    Если нет активной подписки или она бессрочная:
+    - Удаляет старую и создаёт новую
+
+    Returns:
+        dict: {"action": "created"|"extended", "expires_at": str|None, "days_added": int|None}
+    """
     plan_info = SUBSCRIPTION_PLANS.get(plan)
     if not plan_info:
-        return
-
-    now = datetime.now(timezone.utc)
-    expires_at = None
-    if plan_info["duration_days"]:
-        expires_at = now + timedelta(days=plan_info["duration_days"])
+        return {"action": "error", "expires_at": None, "days_added": None}
 
     conn = _get_connection()
     cursor = conn.cursor()
 
-    # Удаляем все старые записи, оставляем одну актуальную
-    cursor.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
+    # Проверяем, есть ли активная подписка
     cursor.execute(
-        "INSERT INTO subscriptions (user_id, plan, status, expires_at) VALUES (?, ?, 'active', ?)",
-        (user_id, plan, expires_at.isoformat() if expires_at else None),
+        "SELECT id, plan, expires_at FROM subscriptions "
+        "WHERE user_id = ? AND status = 'active' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (user_id,)
     )
+    row = cursor.fetchone()
 
-    conn.commit()
-    conn.close()
-    logger.info(f"Activated subscription '{plan}' for user {user_id}")
+    now = datetime.now(timezone.utc)
+    duration_days = plan_info["duration_days"]
 
-    # Начисляем 7 дней владельцу реферальной ссылки, если пользователь пришёл по чьей-то ссылке
-    referral_code = get_user_referral_code(user_id)
-    if referral_code:
-        owner_id = get_referral_link_owner(referral_code)
-        if owner_id:
-            success = add_days_to_subscription(owner_id, 7)
-            if success:
-                logger.info(f"✓ Awarded 7 days to referral link owner {owner_id} (referrer of user {user_id})")
-            else:
-                logger.info(f"Referral link owner {owner_id} has no active subscription, skipping reward")
+    if row and row["expires_at"] and duration_days:
+        # Есть активная подписка с датой истечения - добавляем дни
+        current_expires = datetime.fromisoformat(row["expires_at"])
+        new_expires = current_expires + timedelta(days=duration_days)
+
+        cursor.execute(
+            "UPDATE subscriptions SET expires_at = ?, plan = ? WHERE id = ?",
+            (new_expires.isoformat(), plan, row["id"])
+        )
+
+        # ВАЖНО: Очищаем все старые уведомления для этой подписки
+        # Чтобы система могла отправить новые уведомления для новой даты истечения
+        cursor.execute(
+            "DELETE FROM expiry_notifications WHERE subscription_id = ?",
+            (row["id"],)
+        )
+        deleted_notifications = cursor.rowcount
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f"Extended subscription for user {user_id}: added {duration_days} days from {plan} (new expires: {new_expires.isoformat()})")
+        logger.info(f"Cleared {deleted_notifications} old notification records for subscription {row['id']}")
+
+        # Начисляем 7 дней владельцу реферальной ссылки
+        referral_code = get_user_referral_code(user_id)
+        if referral_code:
+            owner_id = get_referral_link_owner(referral_code)
+            if owner_id:
+                success = add_days_to_subscription(owner_id, 7)
+                if success:
+                    logger.info(f"✓ Awarded 7 days to referral link owner {owner_id} (referrer of user {user_id})")
+                else:
+                    logger.info(f"Referral link owner {owner_id} has no active subscription, skipping reward")
+
+        return {
+            "action": "extended",
+            "expires_at": new_expires.isoformat(),
+            "days_added": duration_days
+        }
+
+    else:
+        # Нет активной подписки или она бессрочная - создаём новую
+        expires_at = None
+        if duration_days:
+            expires_at = now + timedelta(days=duration_days)
+
+        # Удаляем все старые уведомления для пользователя
+        cursor.execute("DELETE FROM expiry_notifications WHERE user_id = ?", (user_id,))
+        deleted_notifications = cursor.rowcount
+
+        # Удаляем все старые подписки
+        cursor.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
+        cursor.execute(
+            "INSERT INTO subscriptions (user_id, plan, status, expires_at) VALUES (?, ?, 'active', ?)",
+            (user_id, plan, expires_at.isoformat() if expires_at else None),
+        )
+
+        conn.commit()
+        conn.close()
+        logger.info(f"Activated subscription '{plan}' for user {user_id}")
+        if deleted_notifications > 0:
+            logger.info(f"Cleared {deleted_notifications} old notification records for user {user_id}")
+
+        # Начисляем 7 дней владельцу реферальной ссылки
+        referral_code = get_user_referral_code(user_id)
+        if referral_code:
+            owner_id = get_referral_link_owner(referral_code)
+            if owner_id:
+                success = add_days_to_subscription(owner_id, 7)
+                if success:
+                    logger.info(f"✓ Awarded 7 days to referral link owner {owner_id} (referrer of user {user_id})")
+                else:
+                    logger.info(f"Referral link owner {owner_id} has no active subscription, skipping reward")
+
+        return {
+            "action": "created",
+            "expires_at": expires_at.isoformat() if expires_at else None,
+            "days_added": duration_days
+        }
 
 
 def activate_free_subscription(user_id: int, days: int) -> dict:
@@ -1012,3 +1102,203 @@ async def create_invite_links(bot: Bot, user_id: int, plan_name: str) -> dict[st
         links["group"] = None
 
     return links
+
+
+# ── Система уведомлений об истечении подписки ──────────────────────
+
+
+def get_subscriptions_requiring_notification() -> list[dict]:
+    """Возвращает подписки, которым требуется отправить уведомление.
+
+    Проверяет подписки на следующие временные метки:
+    - За 3 дня до истечения
+    - За 1 день до истечения
+    - За 1 час до истечения
+    - Истекла (+ grace period 1 час)
+
+    Returns:
+        Список словарей с информацией о подписках и типе уведомления
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+
+    now = datetime.now(timezone.utc)
+    three_days = now + timedelta(days=3)
+    one_day = now + timedelta(days=1)
+    one_hour = now + timedelta(hours=1)
+
+    results = []
+
+    # Получаем все активные подписки с датой истечения
+    cursor.execute(
+        "SELECT id, user_id, plan, expires_at FROM subscriptions "
+        "WHERE status = 'active' AND expires_at IS NOT NULL"
+    )
+    subscriptions = [dict(row) for row in cursor.fetchall()]
+
+    for sub in subscriptions:
+        sub_id = sub["id"]
+        user_id = sub["user_id"]
+        expires_at = datetime.fromisoformat(sub["expires_at"])
+
+        # Проверяем каждый тип уведомления
+        notifications_to_check = [
+            ("3days", three_days),
+            ("1day", one_day),
+            ("1hour", one_hour),
+        ]
+
+        for notif_type, threshold in notifications_to_check:
+            if expires_at <= threshold:
+                # Проверяем, не отправляли ли уже это уведомление
+                cursor.execute(
+                    "SELECT id FROM expiry_notifications "
+                    "WHERE user_id = ? AND subscription_id = ? AND notification_type = ?",
+                    (user_id, sub_id, notif_type)
+                )
+                if not cursor.fetchone():
+                    results.append({
+                        "user_id": user_id,
+                        "subscription_id": sub_id,
+                        "plan": sub["plan"],
+                        "expires_at": sub["expires_at"],
+                        "notification_type": notif_type
+                    })
+
+        # Проверяем истекшие подписки (с grace period)
+        if expires_at <= now:
+            # Проверяем, не отправляли ли уведомление об истечении
+            cursor.execute(
+                "SELECT id FROM expiry_notifications "
+                "WHERE user_id = ? AND subscription_id = ? AND notification_type = 'expired'",
+                (user_id, sub_id)
+            )
+            if not cursor.fetchone():
+                results.append({
+                    "user_id": user_id,
+                    "subscription_id": sub_id,
+                    "plan": sub["plan"],
+                    "expires_at": sub["expires_at"],
+                    "notification_type": "expired"
+                })
+
+    conn.close()
+    return results
+
+
+def mark_notification_sent(user_id: int, subscription_id: int, notification_type: str) -> None:
+    """Записывает факт отправки уведомления."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO expiry_notifications (user_id, subscription_id, notification_type) "
+        "VALUES (?, ?, ?)",
+        (user_id, subscription_id, notification_type)
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"Marked notification as sent: user={user_id}, type={notification_type}")
+
+
+def get_users_to_kick() -> list[dict]:
+    """Возвращает пользователей, которых нужно кикнуть из группы.
+
+    Это пользователи, у которых:
+    - Подписка истекла более часа назад
+    - Уже отправлено уведомление 'expired'
+    - Ещё не были кикнуты (нет уведомления 'kicked')
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+
+    now = datetime.now(timezone.utc)
+    grace_period_end = now - timedelta(hours=1)
+
+    # Находим истекшие подписки с отправленным уведомлением 'expired'
+    # Ищем как active, так и expired подписки (подписка может быть деактивирована до кика)
+    # Исключаем тех, кто уже был кикнут (есть уведомление 'kicked')
+    cursor.execute(
+        "SELECT DISTINCT s.user_id, s.id as subscription_id, s.expires_at, s.plan "
+        "FROM subscriptions s "
+        "JOIN expiry_notifications en ON s.id = en.subscription_id "
+        "WHERE s.status IN ('active', 'expired') "
+        "AND s.expires_at IS NOT NULL "
+        "AND s.expires_at <= ? "
+        "AND en.notification_type = 'expired' "
+        "AND NOT EXISTS ("
+        "    SELECT 1 FROM expiry_notifications "
+        "    WHERE subscription_id = s.id AND notification_type = 'kicked'"
+        ")",
+        (grace_period_end.isoformat(),)
+    )
+
+    results = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return results
+
+
+async def kick_and_unban_user(bot: Bot, user_id: int) -> dict[str, bool]:
+    """Кикает пользователя из чата и группы, затем разбанивает.
+
+    Args:
+        bot: Экземпляр Bot для API-вызовов
+        user_id: ID пользователя Telegram
+
+    Returns:
+        Словарь с результатами: {"chat": bool, "group": bool}
+    """
+    results = {"chat": False, "group": False}
+
+    # Кик из чата
+    if PRIVATE_CHAT_ID != 0:
+        try:
+            await bot.ban_chat_member(chat_id=PRIVATE_CHAT_ID, user_id=user_id)
+            logger.info(f"Kicked user {user_id} from chat {PRIVATE_CHAT_ID}")
+            # Сразу разбаниваем, чтобы не попал в ЧС
+            await bot.unban_chat_member(chat_id=PRIVATE_CHAT_ID, user_id=user_id, only_if_banned=True)
+            logger.info(f"Unbanned user {user_id} from chat {PRIVATE_CHAT_ID}")
+            results["chat"] = True
+        except Exception as e:
+            logger.error(f"Failed to kick/unban user {user_id} from chat: {e}")
+
+    # Кик из группы
+    if PRIVATE_GROUP_ID != 0:
+        try:
+            await bot.ban_chat_member(chat_id=PRIVATE_GROUP_ID, user_id=user_id)
+            logger.info(f"Kicked user {user_id} from group {PRIVATE_GROUP_ID}")
+            # Сразу разбаниваем, чтобы не попал в ЧС
+            await bot.unban_chat_member(chat_id=PRIVATE_GROUP_ID, user_id=user_id, only_if_banned=True)
+            logger.info(f"Unbanned user {user_id} from group {PRIVATE_GROUP_ID}")
+            results["group"] = True
+        except Exception as e:
+            logger.error(f"Failed to kick/unban user {user_id} from group: {e}")
+
+    return results
+
+
+def get_active_users() -> list[dict]:
+    """Возвращает всех пользователей с активной подпиской.
+
+    Returns:
+        Список словарей с информацией о пользователе и подписке
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            up.user_id,
+            up.username,
+            up.first_name,
+            up.last_name,
+            s.plan,
+            s.expires_at
+        FROM user_profiles up
+        JOIN subscriptions s ON up.user_id = s.user_id
+        WHERE s.status = 'active'
+        ORDER BY s.expires_at ASC NULLS LAST
+    """)
+
+    results = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return results

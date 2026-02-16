@@ -5,7 +5,12 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
+from aiogram import Bot
+from dotenv import load_dotenv
 from InquirerPy import inquirer
+
+# Загружаем переменные окружения
+load_dotenv()
 
 DB_PATH = "data/bot.db"
 
@@ -13,6 +18,22 @@ DB_PATH = "data/bot.db"
 def clear() -> None:
     os.system("cls" if os.name == "nt" else "clear")
 MSK = timezone(timedelta(hours=3))
+
+
+async def get_bot_username() -> str:
+    """Получает username бота через Telegram API."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return "DAOPayment_Bot"
+
+    try:
+        bot = Bot(token=token)
+        bot_info = await bot.get_me()
+        await bot.session.close()
+        return bot_info.username if bot_info and bot_info.username else "DAOPayment_Bot"
+    except Exception as e:
+        print(f"Ошибка при получении информации о боте: {e}")
+        return "DAOPayment_Bot"
 
 
 def get_connection() -> sqlite3.Connection:
@@ -370,6 +391,105 @@ def menu_new_referral() -> None:
     print("СОЗДАНИЕ РЕФЕРАЛЬНОЙ ССЫЛКИ")
     print("=" * 80 + "\n")
 
+    # Выбор типа ссылки
+    link_type = inquirer.select(  # type: ignore
+        message="Тип ссылки:",
+        choices=[
+            "Обычная (с оплатой)",
+            "Бесплатная мгновенная (одноразовая)",
+            "< Отмена"
+        ]
+    ).execute()
+
+    if link_type == "< Отмена":
+        return
+
+    is_instant = (link_type == "Бесплатная мгновенная (одноразовая)")
+
+    if is_instant:
+        # Для бесплатной ссылки запрашиваем только количество дней и название
+        days_str = inquirer.text(  # type: ignore
+            message="Количество дней подписки:",
+            default="30"
+        ).execute()
+
+        try:
+            free_days = int(days_str)
+            if free_days <= 0:
+                raise ValueError("Количество дней должно быть положительным")
+        except ValueError:
+            print("\n❌ Некорректное число. Отмена.\n")
+            inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+            return
+
+        name = inquirer.text(  # type: ignore
+            message="Название ссылки (для идентификации):",
+            default=""
+        ).execute()
+
+        name = name.strip() if name.strip() else None
+
+        # Подтверждение
+        clear()
+        print("=" * 80)
+        print("ПОДТВЕРЖДЕНИЕ")
+        print("=" * 80)
+        print(f"  Тип:                 Бесплатная мгновенная (одноразовая)")
+        print(f"  Название:            {name if name else 'без названия'}")
+        print(f"  Количество дней:     {free_days}")
+        print("=" * 80 + "\n")
+
+        confirm = inquirer.select(  # type: ignore
+            message="Создать ссылку?",
+            choices=["Да", "Нет"]
+        ).execute()
+
+        if confirm != "Да":
+            return
+
+        # Создание бесплатной ссылки (одноразовая, max_uses=1)
+        code = create_referral_link(
+            max_uses=1,
+            custom_prices=None,
+            name=name,
+            free_days=free_days,
+            is_instant=True
+        )
+
+        # Получаем username бота и формируем ссылку
+        bot_username = asyncio.run(get_bot_username())
+        referral_url = f"https://t.me/{bot_username}?start={code}"
+
+        # Сохраняем в файл
+        os.makedirs("data", exist_ok=True)
+        filepath = f"data/referral_free_{code}.txt"
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(f"Бесплатная реферальная ссылка\n")
+            f.write("=" * 80 + "\n\n")
+            if name:
+                f.write(f"Название: {name}\n")
+            f.write(f"Код: {code}\n")
+            f.write(f"Ссылка: {referral_url}\n\n")
+            f.write(f"Тип: Мгновенная активация (одноразовая)\n")
+            f.write(f"Количество дней: {free_days}\n")
+
+        # Показываем результат
+        clear()
+        print("=" * 80)
+        print("✅ БЕСПЛАТНАЯ ССЫЛКА СОЗДАНА")
+        print("=" * 80)
+        if name:
+            print(f"\nНазвание: {name}")
+        print(f"Код: {code}")
+        print(f"Ссылка: {referral_url}")
+        print(f"Количество дней: {free_days}")
+        print(f"\nСохранено в: {filepath}\n")
+        print("=" * 80 + "\n")
+
+        inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+        return
+
+    # Для обычной ссылки - старый функционал
     # 1. Лимит пользователей
     max_uses_str = inquirer.text(  # type: ignore
         message="Лимит использований (оставьте пустым для безлимита):",
@@ -419,6 +539,7 @@ def menu_new_referral() -> None:
     print("=" * 80)
     print("ПОДТВЕРЖДЕНИЕ")
     print("=" * 80)
+    print(f"  Тип:                 Обычная (с оплатой)")
     print(f"  Название:            {name if name else 'без названия'}")
     print(f"  Лимит использований: {max_uses if max_uses else 'безлимит'}")
     print(f"  Кастомные цены:      {custom_prices if custom_prices else 'дефолтные'}")
@@ -435,8 +556,9 @@ def menu_new_referral() -> None:
     # 5. Создание и сохранение
     code = create_referral_link(max_uses, custom_prices, name)
 
-    # Формируем ссылку
-    referral_url = f"https://t.me/DAOPayment_Bot?start={code}"
+    # Получаем username бота и формируем ссылку
+    bot_username = asyncio.run(get_bot_username())
+    referral_url = f"https://t.me/{bot_username}?start={code}"
 
     # Сохраняем в файл
     os.makedirs("data", exist_ok=True)
@@ -454,16 +576,16 @@ def menu_new_referral() -> None:
     # Показываем результат
     clear()
     print("=" * 80)
-    print("OK REFERALNAYA SSYLKA SOZDANA")
+    print("✅ РЕФЕРАЛЬНАЯ ССЫЛКА СОЗДАНА")
     print("=" * 80)
     if name:
-        print(f"\nNazvanie: {name}")
-    print(f"Kod: {code}")
-    print(f"Ssylka: {referral_url}\n")
-    print(f"Sohraneno v: {filepath}\n")
+        print(f"\nНазвание: {name}")
+    print(f"Код: {code}")
+    print(f"Ссылка: {referral_url}\n")
+    print(f"Сохранено в: {filepath}\n")
     print("=" * 80 + "\n")
 
-    inquirer.select(message="", choices=["< Nazad"]).execute()  # type: ignore
+    inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
 
 
 # ── Check Balance ──────────────────────────────────────────

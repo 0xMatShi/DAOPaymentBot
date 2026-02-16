@@ -9,6 +9,7 @@ from aiogram.types import (
 from aiogram.exceptions import TelegramForbiddenError
 from datetime import datetime, timezone, timedelta
 from aiogram.enums import ParseMode
+import os
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 
@@ -28,6 +29,7 @@ from src.payments import (
     complete_payment_session,
     record_payment,
     activate_subscription,
+    activate_free_subscription,
     update_user_profile,
     get_user_profile,
     get_referral_link,
@@ -164,6 +166,7 @@ def back_kb(callback_data: str = "back_to_main") -> InlineKeyboardMarkup:
 async def cmd_start_with_referral(message: Message, state: FSMContext) -> None:
     """Обработка старта с реферальным кодом."""
     user = message.from_user  # type: ignore
+    bot = message.bot  # type: ignore
 
     # Получаем реферальный код из deep link параметра
     args = message.text.split(maxsplit=1)  # type: ignore
@@ -180,11 +183,105 @@ async def cmd_start_with_referral(message: Message, state: FSMContext) -> None:
         logger.info(f"Referral link lookup: {ref_link}")
 
         if ref_link and ref_link["is_active"]:
-            success = use_referral_link(user.id, referral_code) # type: ignore
-            if success:
-                logger.info(f"✓ User {user.id} successfully used referral code {referral_code}") # type: ignore
+            # Проверяем, является ли это мгновенной бесплатной ссылкой
+            is_instant = ref_link.get("is_instant", 0) == 1
+            free_days = ref_link.get("free_days")
+
+            if is_instant and free_days:
+                # Пытаемся использовать ссылку (она одноразовая)
+                success = use_referral_link(user.id, referral_code) # type: ignore
+
+                if success:
+                    logger.info(f"✓ User {user.id} successfully used instant referral code {referral_code}") # type: ignore
+
+                    # Активируем бесплатную подписку (или продлеваем существующую)
+                    result = activate_free_subscription(user.id, free_days) # type: ignore
+                    action = result.get("action")
+
+                    if action == "skipped":
+                        # У пользователя бессрочная подписка
+                        await safe_send_message(
+                            message,
+                            "У вас уже есть бессрочная подписка! 🎉\n\n"
+                            "Бесплатные дни не могут быть добавлены к бессрочной подписке."
+                        )
+                        await state.clear()
+                        cancel_user_payment_sessions(user.id) # type: ignore
+                        return
+
+                    # Генерируем пригласительные ссылки для чата и группы
+                    try:
+                        invite_links = await create_invite_links(bot, user.id, f"Бесплатная подписка ({free_days} дней)") # type: ignore
+
+                        link_text = "\n\n📱 Ваши одноразовые ссылки для вступления:"
+
+                        if invite_links.get("chat"):
+                            link_text += f"\n\n🔹 Чат:\n{invite_links['chat']}"
+                        else:
+                            link_text += f"\n\n🔹 Чат:\n⚠️ Не удалось создать ссылку"
+
+                        if invite_links.get("group"):
+                            link_text += f"\n\n🔹 Группа:\n{invite_links['group']}"
+                        else:
+                            link_text += f"\n\n🔹 Группа:\n⚠️ Не удалось создать ссылку"
+
+                        link_text += "\n\n⚠️ Каждая ссылка станет недействительной после присоединения одного человека!"
+
+                    except Exception as e:
+                        logger.error(f"Failed to create invite links for user {user.id}: {e}") # type: ignore
+                        link_text = "\n\n⚠️ Не удалось создать пригласительные ссылки. Обратитесь в поддержку."
+
+                    # Формируем сообщение в зависимости от действия
+                    if action == "created":
+                        success_text = (
+                            f"🎉 Поздравляем!\n\n"
+                            f"Вам активирована бесплатная подписка на {free_days} дней!"
+                            f"{link_text}"
+                        )
+                    elif action == "extended":
+                        # Вычисляем новую дату истечения для отображения
+                        expires_at = result.get("expires_at")
+                        if expires_at:
+                            expires_dt = datetime.fromisoformat(expires_at).astimezone(timezone(timedelta(hours=3)))
+                            expires_str = expires_dt.strftime('%d.%m.%Y %H:%M')
+                        else:
+                            expires_str = "не определена"
+
+                        success_text = (
+                            f"🎉 Отлично!\n\n"
+                            f"К вашей подписке добавлено {free_days} дней!\n\n"
+                            f"Новая дата истечения: {expires_str} (МСК)"
+                            f"{link_text}"
+                        )
+                    else:
+                        success_text = (
+                            f"🎉 Поздравляем!\n\n"
+                            f"Вам активирована бесплатная подписка на {free_days} дней!"
+                            f"{link_text}"
+                        )
+
+                    await safe_send_message(message, success_text)
+
+                    # Очищаем FSM и сессии
+                    await state.clear()
+                    cancel_user_payment_sessions(user.id) # type: ignore
+                    return  # Не показываем главное меню, т.к. уже отправили сообщение с доступом
+                else:
+                    logger.warning(f"✗ User {user.id} failed to use instant referral code {referral_code} (already used or limit reached)") # type: ignore
+                    await safe_send_message(
+                        message,
+                        "❌ Эта реферальная ссылка уже была использована или недействительна."
+                    )
+                    await state.clear()
+                    cancel_user_payment_sessions(user.id) # type: ignore
+                    return
             else:
-                logger.warning(f"✗ User {user.id} failed to use referral code {referral_code} (already used or limit reached)") # type: ignore
+                # Обычная реферальная ссылка (не мгновенная)
+                success = use_referral_link(user.id, referral_code) # type: ignore
+                if success:
+                    logger.info(f"✓ User {user.id} successfully used referral code {referral_code}") # type: ignore
+                else:
+                    logger.warning(f"✗ User {user.id} failed to use referral code {referral_code} (already used or limit reached)") # type: ignore
         else:
             logger.warning(f"✗ Referral link {referral_code} not found or inactive")
 

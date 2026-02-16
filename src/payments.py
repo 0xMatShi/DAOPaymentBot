@@ -211,6 +211,12 @@ def init_db() -> None:
     if "owner_user_id" not in existing_ref:
         cursor.execute("ALTER TABLE referral_links ADD COLUMN owner_user_id INTEGER")
 
+    # Миграция: добавить колонки для бесплатных реферальных ссылок
+    if "free_days" not in existing_ref:
+        cursor.execute("ALTER TABLE referral_links ADD COLUMN free_days INTEGER")
+    if "is_instant" not in existing_ref:
+        cursor.execute("ALTER TABLE referral_links ADD COLUMN is_instant INTEGER DEFAULT 0")
+
     conn.commit()
     conn.close()
 
@@ -342,13 +348,21 @@ def get_user_profile(user_id: int) -> dict | None:
     return None
 
 
-def create_referral_link(max_uses: int | None, custom_prices: str | None, name: str | None = None) -> str:
+def create_referral_link(
+    max_uses: int | None,
+    custom_prices: str | None,
+    name: str | None = None,
+    free_days: int | None = None,
+    is_instant: bool = False
+) -> str:
     """Создает реферальную ссылку с уникальным кодом.
 
     Args:
         max_uses: Лимит использований (None = безлимит)
         custom_prices: Кастомные цены ("35,90,200" или None)
         name: Название ссылки для идентификации
+        free_days: Количество бесплатных дней подписки (None = обычная платная ссылка)
+        is_instant: Флаг мгновенной активации (True = активировать сразу при переходе)
 
     Returns:
         Уникальный код ссылки
@@ -361,13 +375,15 @@ def create_referral_link(max_uses: int | None, custom_prices: str | None, name: 
     conn = _get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO referral_links (code, max_uses, custom_prices, name) VALUES (?, ?, ?, ?)",
-        (code, max_uses, custom_prices, name)
+        "INSERT INTO referral_links (code, max_uses, custom_prices, name, free_days, is_instant) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (code, max_uses, custom_prices, name, free_days, 1 if is_instant else 0)
     )
     conn.commit()
     conn.close()
 
-    logger.info(f"Created referral link: code={code}, name={name}, max_uses={max_uses}, custom_prices={custom_prices}")
+    logger.info(f"Created referral link: code={code}, name={name}, max_uses={max_uses}, "
+                f"custom_prices={custom_prices}, free_days={free_days}, is_instant={is_instant}")
     return code
 
 
@@ -376,7 +392,8 @@ def get_referral_link(code: str) -> dict | None:
     conn = _get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, code, max_uses, current_uses, custom_prices, is_active, name FROM referral_links WHERE code = ?",
+        "SELECT id, code, max_uses, current_uses, custom_prices, is_active, name, free_days, is_instant "
+        "FROM referral_links WHERE code = ?",
         (code,)
     )
     row = cursor.fetchone()
@@ -864,6 +881,75 @@ def activate_subscription(user_id: int, plan: str) -> None:
                 logger.info(f"✓ Awarded 7 days to referral link owner {owner_id} (referrer of user {user_id})")
             else:
                 logger.info(f"Referral link owner {owner_id} has no active subscription, skipping reward")
+
+
+def activate_free_subscription(user_id: int, days: int) -> dict:
+    """Активирует бесплатную подписку на указанное количество дней.
+
+    Если у пользователя уже есть активная подписка:
+    - Если она бессрочная - не добавляет дни
+    - Если есть срок истечения - добавляет к нему указанное количество дней
+
+    Если нет активной подписки - создаёт новую на указанное количество дней.
+
+    Args:
+        user_id: ID пользователя
+        days: Количество дней подписки
+
+    Returns:
+        dict: {"action": "created"|"extended"|"skipped", "expires_at": str|None}
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+
+    # Проверяем, есть ли активная подписка
+    cursor.execute(
+        "SELECT id, plan, expires_at FROM subscriptions "
+        "WHERE user_id = ? AND status = 'active' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (user_id,)
+    )
+    row = cursor.fetchone()
+
+    now = datetime.now(timezone.utc)
+
+    if row:
+        # Есть активная подписка
+        current_expires = row["expires_at"]
+
+        if not current_expires:
+            # Бессрочная подписка - не добавляем дни
+            conn.close()
+            logger.info(f"User {user_id} has lifetime subscription, skipping free days addition")
+            return {"action": "skipped", "expires_at": None}
+
+        # Добавляем дни к существующей подписке
+        expires_dt = datetime.fromisoformat(current_expires)
+        new_expires = expires_dt + timedelta(days=days)
+
+        cursor.execute(
+            "UPDATE subscriptions SET expires_at = ? WHERE id = ?",
+            (new_expires.isoformat(), row["id"])
+        )
+        conn.commit()
+        conn.close()
+
+        logger.info(f"Extended subscription for user {user_id}: added {days} days (new expires: {new_expires.isoformat()})")
+        return {"action": "extended", "expires_at": new_expires.isoformat()}
+
+    else:
+        # Нет активной подписки - создаём новую
+        expires_at = now + timedelta(days=days)
+
+        cursor.execute(
+            "INSERT INTO subscriptions (user_id, plan, status, expires_at) VALUES (?, ?, 'active', ?)",
+            (user_id, f"free_{days}d", expires_at.isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        logger.info(f"Activated free {days}-day subscription for user {user_id} (expires: {expires_at.isoformat()})")
+        return {"action": "created", "expires_at": expires_at.isoformat()}
 
 
 async def create_invite_link_for_chat(bot: Bot, chat_id: int, user_id: int, plan_name: str, chat_type: str) -> str:

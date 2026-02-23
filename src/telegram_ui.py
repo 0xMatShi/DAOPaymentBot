@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 
 from src.logger import logger
 from src.blockchain import get_current_block, verify_transaction_by_hash
-from src.states import PaymentStates
+from src.states import PaymentStates, WithdrawalStates
 from src.payments import (
     SUBSCRIPTION_PLANS,
     SUPPORTED_NETWORKS,
@@ -38,6 +38,13 @@ from src.payments import (
     get_user_referral_info,
     get_plan_price_for_user,
     get_user_own_referral_code,
+    get_referral_balance,
+    add_referral_balance,
+    deduct_referral_balance,
+    create_withdrawal_request,
+    get_withdrawal_request,
+    update_withdrawal_request,
+    get_withdrawal_wallet,
 )
 
 router = Router()
@@ -157,6 +164,14 @@ def back_kb(callback_data: str = "back_to_main") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="< Назад", callback_data=callback_data)],
     ])
+
+
+def profile_kb(can_withdraw: bool) -> InlineKeyboardMarkup:
+    buttons = []
+    if can_withdraw:
+        buttons.append([InlineKeyboardButton(text="💸 Вывод", callback_data="withdrawal_start")])
+    buttons.append([InlineKeyboardButton(text="< Назад", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # ── Хендлеры ────────────────────────────────────────────────
@@ -716,28 +731,351 @@ async def show_profile(callback: CallbackQuery) -> None:
     else:
         status_text = "У вас нет активной подписки."
 
-    # Получаем личную реферальную ссылку (только для пользователей с активной подпиской)
+    # Реферальный баланс
+    balance = get_referral_balance(user_id)
+    balance_text = f"\n\n💰 Реферальный баланс: {balance:.2f}$"
+    if balance >= 10:
+        balance_text += "\n(доступен вывод)"
+    else:
+        balance_text += f"\n(минимум для вывода: 10$)"
+
+    # Личная реферальная ссылка (для всех пользователей, у кого она есть)
     referral_text = ""
-    if subscription:
-        own_referral_code = get_user_own_referral_code(user_id)
-        if own_referral_code:
-            bot_info = await callback.bot.get_me() # type: ignore
-            bot_username = bot_info.username if bot_info and bot_info.username else "PaymentDAOBot"
-            referral_url = f"https://t.me/{bot_username}?start={own_referral_code}"
-            referral_text = f"\n\n🔗 Ваша реферальная ссылка:\n<code>{referral_url}</code>\n\nПриглашайте друзей и получайте +7 дней к подписке за каждую оплату!"
+    own_referral_code = get_user_own_referral_code(user_id)
+    if own_referral_code:
+        bot_info = await callback.bot.get_me()  # type: ignore
+        bot_username = bot_info.username if bot_info and bot_info.username else "PaymentDAOBot"
+        referral_url = f"https://t.me/{bot_username}?start={own_referral_code}"
+        referral_text = (
+            f"\n\n🔗 Ваша реферальная ссылка:\n<code>{referral_url}</code>\n\n"
+            f"Приглашайте друзей и получайте +10$ за каждую их оплату!"
+        )
 
     text = (
         f"Личный кабинет\n\n"
         f"ID: {user_id}\n"
         f"{status_text}"
+        f"{balance_text}"
         f"{referral_text}"
     )
 
-    logger.info(f"User {user_id} opened profile")
-    await safe_edit_message(callback, text, reply_markup=back_kb(), parse_mode=ParseMode.HTML)
+    logger.info(f"User {user_id} opened profile, balance={balance:.2f}$")
+    await safe_edit_message(
+        callback, text, reply_markup=profile_kb(balance >= 10), parse_mode=ParseMode.HTML
+    )
     await callback.answer()
 
 
+
+
+# ── Вывод реферального баланса ──────────────────────────────
+
+
+_WITHDRAWAL_NETWORKS = {
+    "base": "Base",
+    "arbitrum": "Arbitrum One",
+}
+
+
+@router.callback_query(F.data == "withdrawal_start")
+async def withdrawal_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Начало процесса вывода: выбор сети."""
+    user_id = callback.from_user.id
+    balance = get_referral_balance(user_id)
+
+    if balance < 10:
+        await callback.answer("Недостаточно средств. Минимум для вывода: 10$", show_alert=True)
+        return
+
+    await state.update_data(withdrawal_balance=balance)
+    await state.set_state(WithdrawalStates.waiting_for_network)
+
+    network_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Base", callback_data="withdrawal_net:base")],
+        [InlineKeyboardButton(text="Arbitrum One", callback_data="withdrawal_net:arbitrum")],
+        [InlineKeyboardButton(text="< Назад", callback_data="profile")],
+    ])
+
+    text = (
+        f"💸 Вывод средств\n\n"
+        f"Ваш баланс: {balance:.2f}$\n\n"
+        f"Минимальная сумма вывода: 10$\n\n"
+        f"Выберите сеть для получения USDC:"
+    )
+    await safe_edit_message(callback, text, reply_markup=network_kb)
+    await callback.answer()
+
+
+@router.callback_query(WithdrawalStates.waiting_for_network, F.data.startswith("withdrawal_net:"))
+async def withdrawal_network_selected(callback: CallbackQuery, state: FSMContext) -> None:
+    """Пользователь выбрал сеть — просим ввести сумму."""
+    network = callback.data.split(":")[1]  # type: ignore
+    if network not in _WITHDRAWAL_NETWORKS:
+        await callback.answer("Неизвестная сеть", show_alert=True)
+        return
+
+    data = await state.get_data()
+    balance = data.get("withdrawal_balance", 0.0)
+
+    await state.update_data(withdrawal_network=network)
+    await state.set_state(WithdrawalStates.waiting_for_amount)
+
+    net_name = _WITHDRAWAL_NETWORKS[network]
+    await safe_edit_message(
+        callback,
+        f"💸 Вывод средств\n\n"
+        f"Сеть: {net_name}\n"
+        f"Ваш баланс: {balance:.2f}$\n\n"
+        f"Введите сумму для вывода (от 30$ до {balance:.2f}$):",
+        reply_markup=None,
+    )
+    await callback.answer()
+
+
+@router.message(WithdrawalStates.waiting_for_amount, F.text)
+async def process_withdrawal_amount(message: Message, state: FSMContext) -> None:
+    """Обработка введённой суммы вывода."""
+    user_id = message.from_user.id  # type: ignore
+    data = await state.get_data()
+    network = data.get("withdrawal_network", "")
+    net_name = _WITHDRAWAL_NETWORKS.get(network, network)
+
+    try:
+        amount = float(message.text.strip().replace(",", "."))  # type: ignore
+    except ValueError:
+        await safe_send_message(message, "Введите корректную сумму числом. Например: 30")
+        return
+
+    if amount < 10:
+        await safe_send_message(message, "Минимальная сумма вывода: 10$. Введите сумму ещё раз:")
+        return
+
+    actual_balance = get_referral_balance(user_id)
+    if amount > actual_balance:
+        await safe_send_message(
+            message,
+            f"Недостаточно средств. Ваш баланс: {actual_balance:.2f}$\nВведите сумму ещё раз:"
+        )
+        return
+
+    await state.update_data(withdrawal_amount=amount, withdrawal_balance=actual_balance)
+    await state.set_state(WithdrawalStates.waiting_for_address)
+
+    await safe_send_message(
+        message,
+        f"Сумма: {amount:.2f}$\nСеть: {net_name}\n\n"
+        f"Введите EVM-адрес кошелька (0x...) для получения USDC:"
+    )
+
+
+@router.message(WithdrawalStates.waiting_for_address, F.text)
+async def process_withdrawal_address(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Обработка EVM-адреса — создаём запрос и отправляем уведомление админам."""
+    import re
+
+    user_id = message.from_user.id  # type: ignore
+    evm_address = message.text.strip()  # type: ignore
+
+    # Валидация EVM-адреса (0x + 40 hex-символов)
+    if not re.match(r"^0x[0-9a-fA-F]{40}$", evm_address):
+        await safe_send_message(
+            message,
+            "Неверный EVM-адрес. Адрес должен начинаться с 0x и содержать 42 символа.\nПопробуйте ещё раз:"
+        )
+        return
+
+    data = await state.get_data()
+    amount = data.get("withdrawal_amount", 0.0)
+    network = data.get("withdrawal_network", "")
+    net_name = _WITHDRAWAL_NETWORKS.get(network, network)
+
+    # Создаём запрос (списывает баланс)
+    request_id = create_withdrawal_request(user_id, amount, evm_address, network)
+    if request_id is None:
+        await safe_send_message(
+            message,
+            "Ошибка при создании запроса. Возможно, недостаточно средств или уже есть активный запрос.\n"
+            "Нажмите /start и попробуйте позже."
+        )
+        await state.clear()
+        return
+
+    # Формируем уведомление для администраторов
+    profile = get_user_profile(user_id)
+    username = profile.get("username") if profile else None
+    user_display = f"@{username}" if username else f"id:{user_id}"
+
+    now_msk = datetime.now(timezone(timedelta(hours=3)))
+    time_str = now_msk.strftime("%H:%M:%S")
+
+    notification_text = (
+        f"Пользователь {user_display} оставил запрос на вывод.\n"
+        f"Сумма: {amount:.0f}$\n"
+        f"Сеть: {net_name}\n"
+        f"Адрес: {evm_address}\n"
+        f"Время: {time_str}(МСК)"
+    )
+
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Подтвердить", callback_data=f"confirm_withdrawal:{request_id}")]
+    ])
+
+    withdrawal_chat_id_str = os.getenv("WITHDRAWAL_CHAT_ID", "").strip()
+    if not withdrawal_chat_id_str:
+        logger.error("WITHDRAWAL_CHAT_ID не задан в .env")
+        add_referral_balance(user_id, amount)
+        update_withdrawal_request(request_id, status="failed")
+        await safe_send_message(
+            message,
+            "Ошибка конфигурации бота. Обратитесь в поддержку.\nБаланс восстановлен."
+        )
+        await state.clear()
+        return
+
+    withdrawal_chat_id = int(withdrawal_chat_id_str)
+
+    try:
+        sent_msg = await bot.send_message(
+            withdrawal_chat_id, notification_text, reply_markup=confirm_kb
+        )
+        update_withdrawal_request(
+            request_id,
+            notification_message_id=sent_msg.message_id,
+            notification_chat_id=withdrawal_chat_id,
+        )
+        logger.info(f"Запрос на вывод #{request_id} отправлен в чат {withdrawal_chat_id}")
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление о выводе: {e}")
+        add_referral_balance(user_id, amount)
+        update_withdrawal_request(request_id, status="failed")
+        await safe_send_message(
+            message,
+            "Не удалось отправить запрос администратору. Баланс восстановлен.\nПопробуйте позже."
+        )
+        await state.clear()
+        return
+
+    await safe_send_message(
+        message,
+        f"✅ Запрос на вывод {amount:.0f}$ отправлен на подтверждение.\n\n"
+        f"Сеть: {net_name}\n"
+        f"Адрес: {evm_address}\n\n"
+        f"Ожидайте — средства будут переведены в течение 24-х часов."
+    )
+    await state.clear()
+    logger.info(f"Пользователь {user_id} оформил вывод #{request_id}: {amount}$ → {evm_address} ({network})")
+
+
+@router.callback_query(F.data.startswith("confirm_withdrawal:"))
+async def confirm_withdrawal_admin(callback: CallbackQuery) -> None:
+    """Администратор подтверждает вывод — отправляем USDC пользователю."""
+    raw_id = callback.data.split(":")[1]  # type: ignore
+    if not raw_id.isdigit():
+        await callback.answer("Неверный формат запроса", show_alert=True)
+        return
+
+    request_id = int(raw_id)
+    request = get_withdrawal_request(request_id)
+
+    if not request:
+        await callback.answer("Запрос не найден", show_alert=True)
+        return
+
+    if request["status"] != "pending":
+        await callback.answer("Запрос уже обработан", show_alert=True)
+        return
+
+    # Меняем сообщение на "ожидание"
+    if callback.message and hasattr(callback.message, "edit_text"):
+        try:
+            await callback.message.edit_text(  # type: ignore
+                "Запрос на вывод подтверждается - ожидание...",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+    await callback.answer()
+
+    update_withdrawal_request(request_id, status="confirming")
+
+    withdrawal_wallet = get_withdrawal_wallet()
+    if not withdrawal_wallet:
+        logger.error("WITHDRAWAL_WALLET_KEY не задан в .env")
+        add_referral_balance(request["user_id"], request["amount"])
+        update_withdrawal_request(request_id, status="failed")
+        if callback.message and hasattr(callback.message, "edit_text"):
+            try:
+                await callback.message.edit_text(  # type: ignore
+                    "❌ Ошибка: кошелёк для вывода не настроен. Баланс пользователя восстановлен."
+                )
+            except Exception:
+                pass
+        return
+
+    network = request.get("network") or "base"
+    net_name = _WITHDRAWAL_NETWORKS.get(network, network)
+    evm_address = request["trc20_address"]  # колонка хранит EVM-адрес
+
+    try:
+        from src.evm_sender import send_erc20_usdc
+
+        tx_hash = await send_erc20_usdc(
+            withdrawal_wallet["private_key"],
+            evm_address,
+            request["amount"],
+            network,
+        )
+
+        update_withdrawal_request(request_id, status="completed", tx_hash=tx_hash)
+
+        profile = get_user_profile(request["user_id"])
+        username = profile.get("username") if profile else None
+        user_display = f"@{username}" if username else f"id:{request['user_id']}"
+
+        if callback.message and hasattr(callback.message, "edit_text"):
+            try:
+                await callback.message.edit_text(  # type: ignore
+                    f"Запрос на вывод для {user_display} успешно подтвержден - средства отправлены!\n"
+                    f"Адрес получателя: {evm_address}\n"
+                    f"Сеть: {net_name}\n"
+                    f"Tx_Hash: {tx_hash}"
+                )
+            except Exception:
+                pass
+
+        try:
+            await callback.bot.send_message(  # type: ignore
+                request["user_id"],
+                f"✅ Вывод средств выполнен!\n\n"
+                f"Сумма: {request['amount']:.0f}$\n"
+                f"Сеть: {net_name}\n"
+                f"Адрес: {evm_address}\n"
+                f"Tx Hash: {tx_hash}",
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить пользователя {request['user_id']} о выводе: {e}")
+
+        logger.info(f"Вывод #{request_id} выполнен: {request['amount']}$ → {evm_address} ({network}), tx={tx_hash}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при отправке USDC для вывода #{request_id}: {e}")
+
+        add_referral_balance(request["user_id"], request["amount"])
+        update_withdrawal_request(request_id, status="failed")
+
+        if callback.message and hasattr(callback.message, "edit_text"):
+            try:
+                await callback.message.edit_text(  # type: ignore
+                    f"❌ Ошибка при отправке средств!\n"
+                    f"Адрес: {evm_address}\n"
+                    f"Сеть: {net_name}\n"
+                    f"Сумма: {request['amount']:.0f}$\n\n"
+                    f"Баланс пользователя восстановлен.\n"
+                    f"Ошибка: {e}"
+                )
+            except Exception:
+                pass
 
 
 # ── Настройка команд бота ───────────────────────────────────

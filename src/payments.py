@@ -230,11 +230,49 @@ def init_db() -> None:
     if "is_instant" not in existing_ref:
         cursor.execute("ALTER TABLE referral_links ADD COLUMN is_instant INTEGER DEFAULT 0")
 
+    # Миграция: добавить реферальный баланс в профили пользователей
+    existing_profiles = {row[1] for row in cursor.execute("PRAGMA table_info(user_profiles)").fetchall()}
+    if "referral_balance" not in existing_profiles:
+        cursor.execute("ALTER TABLE user_profiles ADD COLUMN referral_balance REAL DEFAULT 0")
+
+    # Таблица запросов на вывод реферального баланса
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawal_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            trc20_address TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            tx_hash TEXT,
+            notification_message_id INTEGER,
+            notification_chat_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES user_profiles (user_id)
+        )
+    """)
+
+    # Миграция: добавить колонку network в withdrawal_requests
+    existing_wr = {row[1] for row in cursor.execute("PRAGMA table_info(withdrawal_requests)").fetchall()}
+    if "network" not in existing_wr:
+        cursor.execute("ALTER TABLE withdrawal_requests ADD COLUMN network TEXT")
+
+    # Таблица кошелька для отправки выплат пользователям
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawal_wallets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet_address TEXT NOT NULL,
+            encrypted_private_key TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
 
     # Генерируем мастер-кошельки если их нет
     generate_master_wallets()
+    # Инициализируем кошелёк для вывода из .env если он не в БД
+    _init_withdrawal_wallet()
 
     logger.info("Database initialized")
 
@@ -283,6 +321,209 @@ def generate_master_wallets() -> None:
         )
         logger.info(f"Generated master wallet for solana: {sol_address}")
 
+    conn.commit()
+    conn.close()
+
+
+def _init_withdrawal_wallet() -> None:
+    """Сохраняет публичный EVM-адрес кошелька вывода в БД (приватник только в .env)."""
+    wallet_key = os.getenv("WITHDRAWAL_WALLET_KEY", "").strip()
+    if not wallet_key:
+        return  # Не настроено — пропускаем
+
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM withdrawal_wallets LIMIT 1")
+    if cursor.fetchone():
+        conn.close()
+        return  # Уже инициализирован
+
+    key_hex = wallet_key.lstrip("0x")
+    try:
+        evm_address = Account.from_key(f"0x{key_hex}").address
+    except Exception as e:
+        logger.error(f"Не удалось вычислить EVM-адрес из WITHDRAWAL_WALLET_KEY: {e}")
+        conn.close()
+        return
+
+    # Приватный ключ в БД не хранится — только публичный EVM-адрес
+    cursor.execute(
+        "INSERT INTO withdrawal_wallets (wallet_address, encrypted_private_key) VALUES (?, '')",
+        (evm_address,),
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"Публичный EVM-адрес кошелька вывода сохранён в БД: {evm_address}")
+
+
+def get_withdrawal_wallet() -> dict | None:
+    """Возвращает EVM-адрес и приватный ключ кошелька для вывода.
+
+    Приватный ключ всегда берётся из .env (WITHDRAWAL_WALLET_KEY).
+    """
+    wallet_key = os.getenv("WITHDRAWAL_WALLET_KEY", "").strip()
+    if not wallet_key:
+        logger.error("WITHDRAWAL_WALLET_KEY не задан в .env")
+        return None
+
+    key_hex = wallet_key.lstrip("0x")
+    try:
+        evm_address = Account.from_key(f"0x{key_hex}").address
+    except Exception as e:
+        logger.error(f"Не удалось вычислить EVM-адрес из WITHDRAWAL_WALLET_KEY: {e}")
+        return None
+
+    return {"address": evm_address, "private_key": key_hex}
+
+
+def get_referral_balance(user_id: int) -> float:
+    """Возвращает реферальный баланс пользователя в долларах."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT referral_balance FROM user_profiles WHERE user_id = ?", (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return float(row["referral_balance"]) if row and row["referral_balance"] else 0.0
+
+
+def add_referral_balance(user_id: int, amount: float) -> None:
+    """Начисляет сумму на реферальный баланс пользователя."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE user_profiles SET referral_balance = referral_balance + ? WHERE user_id = ?",
+        (amount, user_id),
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"Начислено {amount}$ на реферальный баланс пользователя {user_id}")
+
+
+def deduct_referral_balance(user_id: int, amount: float) -> bool:
+    """Списывает сумму с реферального баланса. Возвращает True если успешно."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT referral_balance FROM user_profiles WHERE user_id = ?", (user_id,)
+    )
+    row = cursor.fetchone()
+    balance = float(row["referral_balance"]) if row and row["referral_balance"] else 0.0
+
+    if balance < amount:
+        conn.close()
+        return False
+
+    cursor.execute(
+        "UPDATE user_profiles SET referral_balance = referral_balance - ? WHERE user_id = ?",
+        (amount, user_id),
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"Списано {amount}$ с реферального баланса пользователя {user_id}")
+    return True
+
+
+def create_withdrawal_request(user_id: int, amount: float, evm_address: str, network: str) -> int | None:
+    """Создаёт запрос на вывод и списывает сумму с баланса.
+
+    Returns:
+        ID запроса или None если ошибка (недостаточно средств или уже есть pending-запрос)
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+
+    # Проверяем баланс
+    cursor.execute(
+        "SELECT referral_balance FROM user_profiles WHERE user_id = ?", (user_id,)
+    )
+    row = cursor.fetchone()
+    balance = float(row["referral_balance"]) if row and row["referral_balance"] else 0.0
+
+    if balance < amount:
+        conn.close()
+        logger.warning(f"Пользователь {user_id} запросил вывод {amount}$ при балансе {balance}$")
+        return None
+
+    # Проверяем нет ли уже pending-запроса
+    cursor.execute(
+        "SELECT id FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'confirming')",
+        (user_id,),
+    )
+    if cursor.fetchone():
+        conn.close()
+        logger.warning(f"Пользователь {user_id} уже имеет активный запрос на вывод")
+        return None
+
+    # Списываем баланс
+    cursor.execute(
+        "UPDATE user_profiles SET referral_balance = referral_balance - ? WHERE user_id = ?",
+        (amount, user_id),
+    )
+
+    # Создаём запрос
+    cursor.execute(
+        "INSERT INTO withdrawal_requests (user_id, amount, trc20_address, network) VALUES (?, ?, ?, ?)",
+        (user_id, amount, evm_address, network),
+    )
+    request_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Создан запрос на вывод #{request_id} от пользователя {user_id}: {amount}$ → {evm_address} ({network})")
+    return request_id  # type: ignore
+
+
+def get_withdrawal_request(request_id: int) -> dict | None:
+    """Возвращает данные запроса на вывод."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, user_id, amount, trc20_address, network, status, tx_hash, "
+        "notification_message_id, notification_chat_id "
+        "FROM withdrawal_requests WHERE id = ?",
+        (request_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_withdrawal_request(
+    request_id: int,
+    status: str | None = None,
+    tx_hash: str | None = None,
+    notification_message_id: int | None = None,
+    notification_chat_id: int | None = None,
+) -> None:
+    """Обновляет поля запроса на вывод."""
+    updates = []
+    values = []
+
+    if status is not None:
+        updates.append("status = ?")
+        values.append(status)
+    if tx_hash is not None:
+        updates.append("tx_hash = ?")
+        values.append(tx_hash)
+    if notification_message_id is not None:
+        updates.append("notification_message_id = ?")
+        values.append(notification_message_id)
+    if notification_chat_id is not None:
+        updates.append("notification_chat_id = ?")
+        values.append(notification_chat_id)
+
+    if not updates:
+        return
+
+    conn = _get_connection()
+    cursor = conn.cursor()
+    values.append(request_id)
+    cursor.execute(
+        f"UPDATE withdrawal_requests SET {', '.join(updates)} WHERE id = ?",
+        values,
+    )
     conn.commit()
     conn.close()
 
@@ -915,16 +1156,13 @@ def activate_subscription(user_id: int, plan: str) -> dict:
         logger.info(f"Extended subscription for user {user_id}: added {duration_days} days from {plan} (new expires: {new_expires.isoformat()})")
         logger.info(f"Cleared {deleted_notifications} old notification records for subscription {row['id']}")
 
-        # Начисляем 7 дней владельцу реферальной ссылки
+        # Начисляем 10$ на реферальный баланс владельца ссылки
         referral_code = get_user_referral_code(user_id)
         if referral_code:
             owner_id = get_referral_link_owner(referral_code)
             if owner_id:
-                success = add_days_to_subscription(owner_id, 7)
-                if success:
-                    logger.info(f"✓ Awarded 7 days to referral link owner {owner_id} (referrer of user {user_id})")
-                else:
-                    logger.info(f"Referral link owner {owner_id} has no active subscription, skipping reward")
+                add_referral_balance(owner_id, 10.0)
+                logger.info(f"✓ Начислено 10$ на реферальный баланс пользователя {owner_id} (пригласил {user_id})")
 
         return {
             "action": "extended",
@@ -955,16 +1193,13 @@ def activate_subscription(user_id: int, plan: str) -> dict:
         if deleted_notifications > 0:
             logger.info(f"Cleared {deleted_notifications} old notification records for user {user_id}")
 
-        # Начисляем 7 дней владельцу реферальной ссылки
+        # Начисляем 10$ на реферальный баланс владельца ссылки
         referral_code = get_user_referral_code(user_id)
         if referral_code:
             owner_id = get_referral_link_owner(referral_code)
             if owner_id:
-                success = add_days_to_subscription(owner_id, 7)
-                if success:
-                    logger.info(f"✓ Awarded 7 days to referral link owner {owner_id} (referrer of user {user_id})")
-                else:
-                    logger.info(f"Referral link owner {owner_id} has no active subscription, skipping reward")
+                add_referral_balance(owner_id, 10.0)
+                logger.info(f"✓ Начислено 10$ на реферальный баланс пользователя {owner_id} (пригласил {user_id})")
 
         return {
             "action": "created",

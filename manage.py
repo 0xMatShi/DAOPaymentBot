@@ -793,12 +793,60 @@ async def _fetch_all_balances() -> list[dict]:
     return results
 
 
+def _get_withdrawal_wallet_address() -> str | None:
+    """Возвращает EVM-адрес кошелька для вывода, деривированный из .env."""
+    import sys
+    sys.path.insert(0, ".")
+    from src.payments import get_withdrawal_wallet
+    wallet = get_withdrawal_wallet()
+    return wallet["address"] if wallet else None
+
+
+async def _fetch_withdrawal_wallet_balances() -> list[dict]:
+    """Получает балансы USDC на Base и Arbitrum для кошелька вывода."""
+    import sys
+    sys.path.insert(0, ".")
+    from src.evm_sender import USDC_ADDRESSES, USDC_DECIMALS
+    from src.payments import SUPPORTED_NETWORKS
+
+    address = _get_withdrawal_wallet_address()
+    if not address:
+        return []
+
+    networks = {
+        "base": "Base",
+        "arbitrum": "Arbitrum One",
+    }
+
+    results = []
+    for net_id, net_name in networks.items():
+        usdc_contract = USDC_ADDRESSES.get(net_id)
+        if not usdc_contract:
+            continue
+
+        net_info = SUPPORTED_NETWORKS.get(net_id, {})
+        rpc_url = os.getenv(net_info.get("rpc_url_env", ""), net_info.get("rpc_url_default", ""))
+
+        try:
+            raw = await _evm_token_balance(rpc_url, usdc_contract, address)
+            balance = raw / (10 ** USDC_DECIMALS)
+        except Exception as e:
+            print(f"  [!] Ошибка при запросе USDC на {net_name}: {e}")
+            balance = None
+
+        results.append({"network": net_name, "balance": balance})
+
+    return results
+
+
 def menu_check_balance() -> None:
-    """Проверка балансов USDT/USDC на мастер-кошельках."""
+    """Проверка балансов USDT/USDC на мастер-кошельках и кошельке для вывода."""
     clear()
     print("Загрузка балансов...\n")
 
-    results = asyncio.run(_fetch_all_balances())
+    master_results = asyncio.run(_fetch_all_balances())
+    withdrawal_address = _get_withdrawal_wallet_address()
+    withdrawal_balances = asyncio.run(_fetch_withdrawal_wallet_balances()) if withdrawal_address else []
 
     clear()
     print("=" * 70)
@@ -808,7 +856,7 @@ def menu_check_balance() -> None:
     print("-" * 70)
 
     total = 0.0
-    for r in results:
+    for r in master_results:
         if r["balance"] is not None:
             balance_str = f"{r['balance']:.2f}"
             total += r["balance"]
@@ -818,7 +866,24 @@ def menu_check_balance() -> None:
 
     print("-" * 70)
     print(f"{'ИТОГО':<29} {'$' + f'{total:.2f}':>15}")
+    print("=" * 70)
+
+    print()
+    print("=" * 70)
+    print("КОШЕЛЁК ДЛЯ ВЫПЛАТ (EVM)")
+    print("=" * 70)
+    if withdrawal_address:
+        print(f"Адрес: {withdrawal_address}")
+        if withdrawal_balances:
+            for wb in withdrawal_balances:
+                bal_str = f"{wb['balance']:.2f}$" if wb["balance"] is not None else "ошибка"
+                print(f"  {wb['network']:<20} USDC  {bal_str}")
+        else:
+            print("  Балансы недоступны")
+    else:
+        print("WITHDRAWAL_WALLET_KEY не задан в .env")
     print("=" * 70 + "\n")
+
     inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
 
 

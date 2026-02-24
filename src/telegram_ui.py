@@ -39,6 +39,8 @@ from src.payments import (
     get_plan_price_for_user,
     get_user_own_referral_code,
     get_referral_balance,
+    get_referral_paid_count,
+    get_referral_percent,
     add_referral_balance,
     deduct_referral_balance,
     create_withdrawal_request,
@@ -613,7 +615,7 @@ async def process_tx_hash(message: Message, state: FSMContext, bot: Bot) -> None
     record_payment(user_id, amount, plan_id, network, token, tx_hash)
 
     # Активируем подписку (или продлеваем существующую)
-    result = activate_subscription(user_id, plan_id)
+    result = activate_subscription(user_id, plan_id, amount)
     action = result.get("action")
     expires_at = result.get("expires_at")
     days_added = result.get("days_added")
@@ -746,9 +748,18 @@ async def show_profile(callback: CallbackQuery) -> None:
         bot_info = await callback.bot.get_me()  # type: ignore
         bot_username = bot_info.username if bot_info and bot_info.username else "PaymentDAOBot"
         referral_url = f"https://t.me/{bot_username}?start={own_referral_code}"
+        paid_count = get_referral_paid_count(user_id)
+        current_percent = get_referral_percent(paid_count)
+        next_percent_info = ""
+        if paid_count == 0:
+            next_percent_info = " → после 1-го станет 25%"
+        elif paid_count == 1:
+            next_percent_info = " → после 2-го станет 30%"
         referral_text = (
             f"\n\n🔗 Ваша реферальная ссылка:\n<code>{referral_url}</code>\n\n"
-            f"Приглашайте друзей и получайте +10$ за каждую их оплату!"
+            f"👥 Приведено рефералов: {paid_count}\n"
+            f"💹 Ваш процент: {current_percent}%{next_percent_info}\n\n"
+            f"Приглашайте друзей и получайте {current_percent}% от суммы их оплаты ежемесячно!"
         )
 
     text = (
@@ -826,7 +837,7 @@ async def withdrawal_network_selected(callback: CallbackQuery, state: FSMContext
         f"💸 Вывод средств\n\n"
         f"Сеть: {net_name}\n"
         f"Ваш баланс: {balance:.2f}$\n\n"
-        f"Введите сумму для вывода (от 30$ до {balance:.2f}$):",
+        f"Введите сумму для вывода (от 10$ до {balance:.2f}$):",
         reply_markup=None,
     )
     await callback.answer()
@@ -1015,7 +1026,7 @@ async def confirm_withdrawal_admin(callback: CallbackQuery) -> None:
 
     network = request.get("network") or "base"
     net_name = _WITHDRAWAL_NETWORKS.get(network, network)
-    evm_address = request["trc20_address"]  # колонка хранит EVM-адрес
+    evm_address = request["evm_address"]
 
     try:
         from src.evm_sender import send_erc20_usdc

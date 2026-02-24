@@ -230,10 +230,12 @@ def init_db() -> None:
     if "is_instant" not in existing_ref:
         cursor.execute("ALTER TABLE referral_links ADD COLUMN is_instant INTEGER DEFAULT 0")
 
-    # Миграция: добавить реферальный баланс в профили пользователей
+    # Миграция: добавить реферальный баланс и счётчик в профили пользователей
     existing_profiles = {row[1] for row in cursor.execute("PRAGMA table_info(user_profiles)").fetchall()}
     if "referral_balance" not in existing_profiles:
         cursor.execute("ALTER TABLE user_profiles ADD COLUMN referral_balance REAL DEFAULT 0")
+    if "referral_paid_count" not in existing_profiles:
+        cursor.execute("ALTER TABLE user_profiles ADD COLUMN referral_paid_count INTEGER DEFAULT 0")
 
     # Таблица запросов на вывод реферального баланса
     cursor.execute("""
@@ -241,7 +243,7 @@ def init_db() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             amount REAL NOT NULL,
-            trc20_address TEXT NOT NULL,
+            evm_address TEXT NOT NULL,
             status TEXT DEFAULT 'pending',
             tx_hash TEXT,
             notification_message_id INTEGER,
@@ -255,6 +257,12 @@ def init_db() -> None:
     existing_wr = {row[1] for row in cursor.execute("PRAGMA table_info(withdrawal_requests)").fetchall()}
     if "network" not in existing_wr:
         cursor.execute("ALTER TABLE withdrawal_requests ADD COLUMN network TEXT")
+
+    # Миграция: переименовать trc20_address → evm_address в withdrawal_requests
+    try:
+        cursor.execute("ALTER TABLE withdrawal_requests RENAME COLUMN trc20_address TO evm_address")
+    except Exception:
+        pass
 
     # Таблица кошелька для отправки выплат пользователям
     cursor.execute("""
@@ -401,6 +409,43 @@ def add_referral_balance(user_id: int, amount: float) -> None:
     logger.info(f"Начислено {amount}$ на реферальный баланс пользователя {user_id}")
 
 
+def get_referral_paid_count(user_id: int) -> int:
+    """Возвращает количество рефералов, которые совершили оплату."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT referral_paid_count FROM user_profiles WHERE user_id = ?", (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return int(row["referral_paid_count"]) if row and row["referral_paid_count"] else 0
+
+
+def get_referral_percent(paid_count: int) -> int:
+    """Возвращает процент вознаграждения в зависимости от количества оплативших рефералов.
+
+    0 рефералов → 20%, 1 реферал → 25%, 2+ рефералов → 30%.
+    """
+    if paid_count == 0:
+        return 20
+    elif paid_count == 1:
+        return 25
+    else:
+        return 30
+
+
+def increment_referral_paid_count(user_id: int) -> None:
+    """Увеличивает счётчик оплативших рефералов на 1."""
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE user_profiles SET referral_paid_count = referral_paid_count + 1 WHERE user_id = ?",
+        (user_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
 def deduct_referral_balance(user_id: int, amount: float) -> bool:
     """Списывает сумму с реферального баланса. Возвращает True если успешно."""
     conn = _get_connection()
@@ -464,7 +509,7 @@ def create_withdrawal_request(user_id: int, amount: float, evm_address: str, net
 
     # Создаём запрос
     cursor.execute(
-        "INSERT INTO withdrawal_requests (user_id, amount, trc20_address, network) VALUES (?, ?, ?, ?)",
+        "INSERT INTO withdrawal_requests (user_id, amount, evm_address, network) VALUES (?, ?, ?, ?)",
         (user_id, amount, evm_address, network),
     )
     request_id = cursor.lastrowid
@@ -480,7 +525,7 @@ def get_withdrawal_request(request_id: int) -> dict | None:
     conn = _get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, user_id, amount, trc20_address, network, status, tx_hash, "
+        "SELECT id, user_id, amount, evm_address, network, status, tx_hash, "
         "notification_message_id, notification_chat_id "
         "FROM withdrawal_requests WHERE id = ?",
         (request_id,),
@@ -1101,7 +1146,7 @@ def deactivate_expired_subscriptions() -> list[dict]:
     return [{"user_id": r["user_id"], "plan": r["plan"]} for r in rows]
 
 
-def activate_subscription(user_id: int, plan: str) -> dict:
+def activate_subscription(user_id: int, plan: str, payment_amount: float = 0.0) -> dict:
     """Активирует подписку для пользователя.
 
     Если у пользователя уже есть активная подписка с датой истечения:
@@ -1156,13 +1201,20 @@ def activate_subscription(user_id: int, plan: str) -> dict:
         logger.info(f"Extended subscription for user {user_id}: added {duration_days} days from {plan} (new expires: {new_expires.isoformat()})")
         logger.info(f"Cleared {deleted_notifications} old notification records for subscription {row['id']}")
 
-        # Начисляем 10$ на реферальный баланс владельца ссылки
+        # Начисляем реферальное вознаграждение владельцу ссылки
         referral_code = get_user_referral_code(user_id)
         if referral_code:
             owner_id = get_referral_link_owner(referral_code)
             if owner_id:
-                add_referral_balance(owner_id, 10.0)
-                logger.info(f"✓ Начислено 10$ на реферальный баланс пользователя {owner_id} (пригласил {user_id})")
+                paid_count = get_referral_paid_count(owner_id)
+                percent = get_referral_percent(paid_count)
+                reward = round(payment_amount * percent / 100, 2)
+                increment_referral_paid_count(owner_id)
+                add_referral_balance(owner_id, reward)
+                logger.info(
+                    f"✓ Начислено {reward}$ ({percent}%) на реферальный баланс пользователя {owner_id} "
+                    f"(пригласил {user_id}, сумма платежа {payment_amount}$)"
+                )
 
         return {
             "action": "extended",
@@ -1193,13 +1245,20 @@ def activate_subscription(user_id: int, plan: str) -> dict:
         if deleted_notifications > 0:
             logger.info(f"Cleared {deleted_notifications} old notification records for user {user_id}")
 
-        # Начисляем 10$ на реферальный баланс владельца ссылки
+        # Начисляем реферальное вознаграждение владельцу ссылки
         referral_code = get_user_referral_code(user_id)
         if referral_code:
             owner_id = get_referral_link_owner(referral_code)
             if owner_id:
-                add_referral_balance(owner_id, 10.0)
-                logger.info(f"✓ Начислено 10$ на реферальный баланс пользователя {owner_id} (пригласил {user_id})")
+                paid_count = get_referral_paid_count(owner_id)
+                percent = get_referral_percent(paid_count)
+                reward = round(payment_amount * percent / 100, 2)
+                increment_referral_paid_count(owner_id)
+                add_referral_balance(owner_id, reward)
+                logger.info(
+                    f"✓ Начислено {reward}$ ({percent}%) на реферальный баланс пользователя {owner_id} "
+                    f"(пригласил {user_id}, сумма платежа {payment_amount}$)"
+                )
 
         return {
             "action": "created",

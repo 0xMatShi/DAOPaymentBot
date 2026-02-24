@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramForbiddenError
 
 from src.logger import logger
 from src.payments import (
@@ -76,6 +77,11 @@ async def check_subscription_notifications(bot: Bot) -> None:
                     await bot.send_message(user_id, message)
                     mark_notification_sent(user_id, sub_id, notif_type)
                     logger.info(f"Sent {notif_type} notification to user {user_id}")
+                except TelegramForbiddenError as e:
+                    logger.warning(f"Failed to send {notif_type} notification to user {user_id}: {e}")
+                    # Бот заблокирован — всё равно помечаем уведомление как отправленное,
+                    # чтобы не блокировать кик (get_users_to_kick требует запись 'expired')
+                    mark_notification_sent(user_id, sub_id, notif_type)
                 except Exception as e:
                     logger.warning(f"Failed to send {notif_type} notification to user {user_id}: {e}")
 

@@ -479,18 +479,6 @@ def create_withdrawal_request(user_id: int, amount: float, evm_address: str, net
     conn = _get_connection()
     cursor = conn.cursor()
 
-    # Проверяем баланс
-    cursor.execute(
-        "SELECT referral_balance FROM user_profiles WHERE user_id = ?", (user_id,)
-    )
-    row = cursor.fetchone()
-    balance = float(row["referral_balance"]) if row and row["referral_balance"] else 0.0
-
-    if balance < amount:
-        conn.close()
-        logger.warning(f"Пользователь {user_id} запросил вывод {amount}$ при балансе {balance}$")
-        return None
-
     # Проверяем нет ли уже pending-запроса
     cursor.execute(
         "SELECT id FROM withdrawal_requests WHERE user_id = ? AND status IN ('pending', 'confirming')",
@@ -501,11 +489,17 @@ def create_withdrawal_request(user_id: int, amount: float, evm_address: str, net
         logger.warning(f"Пользователь {user_id} уже имеет активный запрос на вывод")
         return None
 
-    # Списываем баланс
+    # Атомарно списываем баланс: UPDATE выполняется только если referral_balance >= amount.
+    # Проверка и списание — один SQL-statement, race condition невозможен.
     cursor.execute(
-        "UPDATE user_profiles SET referral_balance = referral_balance - ? WHERE user_id = ?",
-        (amount, user_id),
+        "UPDATE user_profiles SET referral_balance = referral_balance - ? "
+        "WHERE user_id = ? AND referral_balance >= ?",
+        (amount, user_id, amount),
     )
+    if cursor.rowcount == 0:
+        conn.close()
+        logger.warning(f"Пользователь {user_id} запросил вывод {amount}$ — недостаточно средств (атомарная проверка)")
+        return None
 
     # Создаём запрос
     cursor.execute(

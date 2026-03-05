@@ -17,6 +17,7 @@ from src.logger import logger
 from src.blockchain import get_current_block, verify_transaction_by_hash
 from src.states import PaymentStates, WithdrawalStates
 from src.payments import (
+    RENEWAL_DISCOUNT,
     SUBSCRIPTION_PLANS,
     SUPPORTED_NETWORKS,
     SUPPORTED_TOKENS,
@@ -47,6 +48,8 @@ from src.payments import (
     get_withdrawal_request,
     update_withdrawal_request,
     get_withdrawal_wallet,
+    has_renewal_discount,
+    get_recently_expired_subscription,
 )
 
 router = Router()
@@ -99,16 +102,16 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def plans_kb(custom_prices: list[float] | None = None) -> InlineKeyboardMarkup:
+def plans_kb(custom_prices: list[float] | None = None, show_discount: bool = False) -> InlineKeyboardMarkup:
     """Создает клавиатуру с планами подписок.
 
     Args:
         custom_prices: список из 3 цен [price_1month, price_3months, price_forever]
                       Если None - используются дефолтные цены
+        show_discount: показывать бейдж скидки -20% рядом с ценой
                       Поддерживаются float значения (35.5, 90.99)
     """
     buttons = []
-    plan_ids = list(SUBSCRIPTION_PLANS.keys())
 
     for idx, (plan_id, plan) in enumerate(SUBSCRIPTION_PLANS.items()):
         if custom_prices and idx < len(custom_prices):
@@ -119,8 +122,15 @@ def plans_kb(custom_prices: list[float] | None = None) -> InlineKeyboardMarkup:
         # Форматируем цену: если целое число, показываем без .0
         price_str = f"{price:.2f}".rstrip('0').rstrip('.') if isinstance(price, float) else str(price)
 
+        if show_discount:
+            orig_price = plan['price']
+            orig_str = f"{orig_price:.2f}".rstrip('0').rstrip('.') if isinstance(orig_price, float) else str(orig_price)
+            label = f"{plan['label']} - {price_str}$ (было {orig_str}$, -20%)"
+        else:
+            label = f"{plan['label']} - {price_str}$"
+
         buttons.append([InlineKeyboardButton(
-            text=f"{plan['label']} - {price_str}$",
+            text=label,
             callback_data=f"plan:{plan_id}",
         )])
     buttons.append([InlineKeyboardButton(text="< Назад", callback_data="back_to_main")])
@@ -363,6 +373,7 @@ async def show_plans(callback: CallbackQuery) -> None:
 
     # Проверяем, есть ли у пользователя реферальный код с кастомными ценами
     custom_prices = None
+    show_discount = False
     referral_code = get_user_referral_code(user.id)
     logger.info(f"Checking referral code for user {user.id}: {referral_code}")
 
@@ -382,21 +393,42 @@ async def show_plans(callback: CallbackQuery) -> None:
     else:
         logger.info(f"No referral code for user {user.id}")
 
+    # Проверяем право на скидку при продлении (только если нет реферальных кастомных цен)
+    if not custom_prices and has_renewal_discount(user.id):
+        show_discount = True
+        custom_prices = [
+            round(float(p["price"]) * (1 - RENEWAL_DISCOUNT), 2)
+            for p in SUBSCRIPTION_PLANS.values()
+        ]
+
     # Если можем продлять - показываем информацию об этом
     message_text = "Выберите одну из предложенных подписок:"
     if subscription and subscription["expires_at"]:
         expires_dt = datetime.fromisoformat(subscription["expires_at"])
         expires_msk = expires_dt.astimezone(timezone(timedelta(hours=3)))
+        discount_note = "\n\nСкидка 20% действует, пока подписка активна." if show_discount else ""
         message_text = (
             f"📝 У вас активная подписка до {expires_msk.strftime('%d.%m.%Y %H:%M')} (МСК)\n\n"
             f"При оплате новой подписки дни будут добавлены к текущей!\n\n"
-            f"Выберите подписку для продления:"
+            f"Выберите подписку для продления:{discount_note}"
         )
+    elif show_discount:
+        # Подписка истекла, но грейс-период ещё активен
+        expired_sub = get_recently_expired_subscription(user.id)
+        if expired_sub:
+            expired_dt = datetime.fromisoformat(expired_sub["expires_at"])
+            discount_until = expired_dt + timedelta(days=7)
+            discount_until_msk = discount_until.astimezone(timezone(timedelta(hours=3)))
+            message_text = (
+                f"Ваша подписка истекла, но скидка 20% на продление действует\n"
+                f"до {discount_until_msk.strftime('%d.%m.%Y %H:%M')} (МСК)!\n\n"
+                f"Выберите подписку для оформления:"
+            )
 
     await safe_edit_message(
         callback,
         message_text,
-        reply_markup=plans_kb(custom_prices),
+        reply_markup=plans_kb(custom_prices, show_discount=show_discount),
     )
     await callback.answer()
 

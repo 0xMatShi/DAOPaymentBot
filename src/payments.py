@@ -928,34 +928,39 @@ def get_all_referral_links() -> list[dict]:
     return links
 
 
+RENEWAL_DISCOUNT = 0.20  # 20% скидка при продлении
+
+
 def get_plan_price_for_user(user_id: int, plan_id: str) -> float:
-    """Возвращает цену плана для пользователя с учетом реферальной ссылки.
+    """Возвращает цену плана для пользователя.
+
+    Приоритет:
+    1. Кастомные цены реферальной ссылки (если есть)
+    2. Скидка 20% при продлении (активная подписка или истекшая <= 7 дней назад)
+    3. Дефолтная цена
 
     Returns:
-        float: Цена в долларах (может быть с плавающей точкой)
+        float: Цена в долларах
     """
-    # Дефолтная цена
     default_price = float(SUBSCRIPTION_PLANS.get(plan_id, {}).get("price", 0))
 
-    # Проверяем реферальный код
+    # Реферальные кастомные цены имеют наивысший приоритет
     referral_code = get_user_referral_code(user_id)
-    if not referral_code:
-        return default_price
+    if referral_code:
+        ref_link = get_referral_link(referral_code)
+        if ref_link and ref_link["custom_prices"]:
+            try:
+                custom_prices = [float(p.strip()) for p in ref_link["custom_prices"].split(",")]
+                plan_ids = list(SUBSCRIPTION_PLANS.keys())
+                plan_index = plan_ids.index(plan_id)
+                if plan_index < len(custom_prices):
+                    return custom_prices[plan_index]
+            except (ValueError, IndexError):
+                logger.warning(f"Failed to get custom price for user {user_id}, plan {plan_id}")
 
-    ref_link = get_referral_link(referral_code)
-    if not ref_link or not ref_link["custom_prices"]:
-        return default_price
-
-    # Парсим кастомные цены (поддержка float)
-    try:
-        custom_prices = [float(p.strip()) for p in ref_link["custom_prices"].split(",")]
-        plan_ids = list(SUBSCRIPTION_PLANS.keys())
-        plan_index = plan_ids.index(plan_id)
-
-        if plan_index < len(custom_prices):
-            return custom_prices[plan_index]
-    except (ValueError, IndexError):
-        logger.warning(f"Failed to get custom price for user {user_id}, plan {plan_id}")
+    # Скидка 20% при продлении (активная подписка или истекшая <= 7 дней назад)
+    if has_renewal_discount(user_id):
+        return round(default_price * (1 - RENEWAL_DISCOUNT), 2)
 
     return default_price
 
@@ -1110,6 +1115,35 @@ def get_user_subscription(user_id: int) -> dict | None:
 
     conn.close()
     return {"plan": row["plan"], "status": row["status"], "expires_at": row["expires_at"]}
+
+
+def get_recently_expired_subscription(user_id: int) -> dict | None:
+    """Возвращает последнюю истёкшую подписку пользователя, если она истекла не более 7 дней назад."""
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT plan, expires_at FROM subscriptions "
+        "WHERE user_id = ? AND status = 'expired' AND expires_at > ? "
+        "ORDER BY expires_at DESC LIMIT 1",
+        (user_id, week_ago),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def has_renewal_discount(user_id: int) -> bool:
+    """Возвращает True если пользователь имеет право на скидку 20% при продлении.
+
+    Условия (без учёта 'навсегда'):
+    - есть активная подписка с датой истечения, ИЛИ
+    - подписка истекла не более 7 дней назад
+    """
+    sub = get_user_subscription(user_id)
+    if sub and sub.get("expires_at"):
+        return True
+    return get_recently_expired_subscription(user_id) is not None
 
 
 def deactivate_expired_subscriptions() -> list[dict]:

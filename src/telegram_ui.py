@@ -352,24 +352,6 @@ async def show_plans(callback: CallbackQuery) -> None:
 
     # Проверяем активную подписку
     subscription = get_user_subscription(user.id)
-    if subscription and subscription["expires_at"]:
-        # Есть активная подписка с датой истечения
-        expires_dt = datetime.fromisoformat(subscription["expires_at"])
-        now = datetime.now(timezone.utc)
-        time_until_expiry = expires_dt - now
-
-        # Если до истечения больше 3 дней - блокируем продление
-        if time_until_expiry > timedelta(days=3):
-            expires_msk = expires_dt.astimezone(timezone(timedelta(hours=3)))
-            await safe_edit_message(
-                callback,
-                f"У вас уже есть активная подписка!\n\n"
-                f"Дата истечения: {expires_msk.strftime('%d.%m.%Y %H:%M')} (МСК)\n\n"
-                f"Продление станет доступно за 3 дня до истечения подписки.",
-                reply_markup=back_kb(),
-            )
-            await callback.answer()
-            return
 
     # Проверяем, есть ли у пользователя реферальный код с кастомными ценами
     custom_prices = None

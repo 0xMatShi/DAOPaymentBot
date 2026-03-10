@@ -12,5 +12,4 @@ dependencies = [
     "loguru>=0.7.3",
     "python-dotenv>=1.2.1",
     "solders>=0.27.1",
-    "tronpy>=0.4.0",
 ]

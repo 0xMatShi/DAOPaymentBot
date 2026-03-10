@@ -424,18 +424,6 @@ async def show_token_selection(callback: CallbackQuery) -> None:
         await callback.answer("Неизвестный план", show_alert=True)
         return
 
-    PLAN_RANK = {"1month": 1, "3months": 2, "forever": 3}
-    sub = get_user_subscription(callback.from_user.id)
-    if sub:
-        current_rank = PLAN_RANK.get(sub["plan"], 0)
-        selected_rank = PLAN_RANK.get(plan_id, 0)
-        if selected_rank == current_rank:
-            await callback.answer("Этот тип подписки уже активирован.", show_alert=True)
-            return
-        if selected_rank < current_rank:
-            await callback.answer("У вас уже приобретён план лучше.", show_alert=True)
-            return
-
     user_id = callback.from_user.id
 
     # Получаем цену с учетом реферальной ссылки

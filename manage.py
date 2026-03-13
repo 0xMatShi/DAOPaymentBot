@@ -887,12 +887,106 @@ def menu_check_balance() -> None:
     inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
 
 
+async def _do_broadcast(user_ids: list[int], text: str) -> tuple[int, int]:
+    """Отправляет сообщение списку пользователей. Возвращает (отправлено, ошибок)."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        print("Ошибка: TELEGRAM_BOT_TOKEN не задан.")
+        return 0, 0
+
+    bot = Bot(token=token)
+    sent = 0
+    failed = 0
+
+    try:
+        for user_id in user_ids:
+            try:
+                await bot.send_message(chat_id=user_id, text=text)
+                sent += 1
+            except Exception:
+                failed += 1
+
+            await asyncio.sleep(1)
+    finally:
+        await bot.session.close()
+
+    return sent, failed
+
+
+def menu_broadcast() -> None:
+    """Рассылка сообщения неактивным пользователям (все кроме активных подписчиков)."""
+    clear()
+    print("=" * 80)
+    print("РАССЫЛКА (все пользователи, кроме активных подписчиков)")
+    print("=" * 80)
+
+    all_users = get_all_users()
+    active_users = get_active_users_list()
+    active_ids = {u["user_id"] for u in active_users}
+    recipients = [u for u in all_users if u["user_id"] not in active_ids]
+
+    if not recipients:
+        print("Нет пользователей для рассылки.\n")
+        inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+        return
+
+    print(f"Всего пользователей:     {len(all_users)}")
+    print(f"Активных подписчиков:    {len(active_ids)} (исключаются)")
+    print(f"Получателей рассылки:    {len(recipients)}\n")
+
+    print("Вставьте текст сообщения и нажмите Enter дважды для завершения:\n")
+
+    lines = []
+    while True:
+        line = input()
+        if line == "" and lines:
+            break
+        lines.append(line)
+
+    text = "\n".join(lines).strip()
+
+    if not text:
+        print("\nСообщение пустое. Отмена.\n")
+        inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+        return
+
+    clear()
+    print("=" * 80)
+    print("ПРЕДПРОСМОТР")
+    print("=" * 80)
+    print(text)
+    print("=" * 80)
+    print(f"\nПолучателей: {len(recipients)}\n")
+
+    confirm = inquirer.select(  # type: ignore
+        message="Отправить?",
+        choices=["Да, отправить", "< Отмена"],
+    ).execute()
+
+    if confirm != "Да, отправить":
+        return
+
+    print(f"\nОтправляю...")
+    user_ids = [u["user_id"] for u in recipients]
+    sent, failed = asyncio.run(_do_broadcast(user_ids, text))
+
+    clear()
+    print("=" * 80)
+    print("РАССЫЛКА ЗАВЕРШЕНА")
+    print("=" * 80)
+    print(f"  Отправлено: {sent}")
+    print(f"  Ошибок:     {failed} (заблокировали бота и т.п.)")
+    print("=" * 80 + "\n")
+
+    inquirer.select(message="", choices=["< Назад"]).execute()  # type: ignore
+
+
 def main() -> None:
     clear()
     while True:
         action = inquirer.select( # type: ignore
             message="Управление ботом:",
-            choices=["Users", "Active Users", "Check Balance", "View Master Wallets", "Export Master Wallets", "New Referral", "Exit"],
+            choices=["Users", "Active Users", "Check Balance", "View Master Wallets", "Export Master Wallets", "New Referral", "Broadcast", "Exit"],
         ).execute()
 
         if action == "Users":
@@ -907,6 +1001,8 @@ def main() -> None:
             menu_export_wallets()
         elif action == "New Referral":
             menu_new_referral()
+        elif action == "Broadcast":
+            menu_broadcast()
         elif action == "Exit":
             break
 
